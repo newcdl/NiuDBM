@@ -1,0 +1,19 @@
+#!/bin/bash
+# 卸载完成：仅清理可再生的临时文件，用户数据一律保留
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_uninstall.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [uninstall_callback] $*"; }
+
+VAR="${TRIM_PKGVAR:-/var/apps/niudbm/var}"
+TMP="${TRIM_PKGTMP:-/var/apps/niudbm/tmp}"
+
+# 缓存可重建，直接清；实例数据、备份、凭据全部保留
+rm -rf "$VAR/cache" 2>/dev/null && say "cache removed"
+rm -rf "$TMP"/* 2>/dev/null
+
+say "kept: $VAR (instances/engines/backups/niudbm.db)"
+say "ok"
+exit 0

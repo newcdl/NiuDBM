@@ -1,0 +1,33 @@
+#!/bin/bash
+# 升级前置：备份元数据库，失败则中止升级
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_upgrade.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [upgrade_init] $*"; }
+
+VAR="${TRIM_PKGVAR:-/var/apps/niudbm/var}"
+STAMP="$(date '+%Y%m%d%H%M%S')"
+
+say "start -> ${TRIM_APPVER:-unknown}"
+
+if [ -f "$VAR/niudbm.db" ]; then
+  if cp -p "$VAR/niudbm.db" "$VAR/niudbm.db.bak-$STAMP" 2>/dev/null; then
+    say "db backup ok: niudbm.db.bak-$STAMP"
+  else
+    say "FAIL: 元数据库备份失败"
+    echo "元数据库备份失败，已中止升级" >&2
+    exit 1
+  fi
+else
+  say "no metadata db, skip backup"
+fi
+
+# 只保留最近 3 份升级前备份
+ls -1t "$VAR"/niudbm.db.bak-* 2>/dev/null | tail -n +4 | while read -r old; do
+  rm -f "$old"
+done
+
+say "ok"
+exit 0

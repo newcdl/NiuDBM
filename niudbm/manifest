@@ -1,0 +1,17 @@
+appname=niudbm
+version=0.1.0
+display_name=牛库管家
+desc=让 NAS 上的数据库管理像装应用一样简单。本版本为平台能力自检包，用于验证目录、权限与访问模型。
+source=thirdparty
+platform=all
+maintainer=小柿子
+maintainer_url=https://fnnas.com
+distributor=小柿子
+distributor_url=https://fnnas.com
+os_min_version=1.1.3100
+desktop_uidir=ui
+ctl_stop=true
+checkport=false
+micro_app=false
+disable_authorization_path=false
+changelog=首个自检版本：可查看目录映射、权限边界与运行身份。

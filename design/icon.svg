@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12857B"/>
+      <stop offset="0.55" stop-color="#0F766E"/>
+      <stop offset="1" stop-color="#0A3533"/>
+    </linearGradient>
+    <linearGradient id="db" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DCEFEC"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- 牛角：从顶层两侧上扬，弱化拟物、保留识别度 -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round" opacity="0.92">
+    <path d="M404 336 C352 268 300 240 250 256"/>
+    <path d="M620 336 C672 268 724 240 774 256"/>
+  </g>
+
+  <!-- 数据库柱体：三层盘片，层间留缝 -->
+  <g fill="url(#db)">
+    <rect x="352" y="328" width="320" height="104" />
+    <ellipse cx="512" cy="328" rx="160" ry="52"/>
+    <ellipse cx="512" cy="432" rx="160" ry="52"/>
+
+    <rect x="352" y="468" width="320" height="104"/>
+    <ellipse cx="512" cy="468" rx="160" ry="52"/>
+    <ellipse cx="512" cy="572" rx="160" ry="52"/>
+
+    <rect x="352" y="608" width="320" height="104"/>
+    <ellipse cx="512" cy="608" rx="160" ry="52"/>
+    <ellipse cx="512" cy="712" rx="160" ry="52"/>
+  </g>
+</svg>

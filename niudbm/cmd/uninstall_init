@@ -1,0 +1,14 @@
+#!/bin/bash
+# 卸载前置：只记录，不做任何删除动作
+# 设计原则（对应核对项 P-22）：卸载默认保留用户数据，删除必须由用户在文件管理中显式完成
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_uninstall.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [uninstall_init] $*"; }
+
+VAR="${TRIM_PKGVAR:-/var/apps/niudbm/var}"
+say "start, data kept at: $VAR"
+say "ok"
+exit 0

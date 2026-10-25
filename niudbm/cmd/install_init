@@ -1,0 +1,35 @@
+#!/bin/bash
+# 安装前置检查：环境不满足时中止安装
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_install.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [install_init] $*"; }
+die() { say "FAIL: $1"; echo "$1" >&2; exit 1; }
+
+say "start"
+
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+case "$ARCH" in
+  x86_64 | aarch64 | arm64) say "arch=$ARCH" ;;
+  *) die "不支持的 CPU 架构：$ARCH" ;;
+esac
+
+if [ -r /proc/meminfo ]; then
+  MEM_MB="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
+  if [ "${MEM_MB:-0}" -lt 512 ]; then
+    die "内存不足 512MB（当前 ${MEM_MB}MB）"
+  fi
+  say "mem=${MEM_MB}MB"
+fi
+
+TARGET="${TRIM_APPDEST:-/}"
+AVAIL_MB="$(df -Pk "$TARGET" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}')"
+if [ "${AVAIL_MB:-0}" -lt 200 ]; then
+  die "目标分区可用空间不足 200MB（当前 ${AVAIL_MB}MB）"
+fi
+say "free=${AVAIL_MB}MB"
+
+say "ok"
+exit 0

@@ -1,0 +1,25 @@
+#!/bin/bash
+# 配置变更完成：确认授权目录落盘并重跑自检
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_config.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [config_callback] $*"; }
+
+APP="niudbm"
+VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
+ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
+TARGET="${TRIM_APPDEST:-/var/apps/$APP/target}"
+
+printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS:-}" > "$ETC/authorized_paths" 2>/dev/null
+rm -f "$ETC/authorized_paths.pending" 2>/dev/null
+
+DIAG="$TARGET/server/diagnose.sh"
+if [ -f "$DIAG" ]; then
+  /bin/bash "$DIAG" > "$VAR/diagnose-report.txt" 2>/dev/null \
+    || say "WARN: 诊断报告生成失败"
+fi
+
+say "ok"
+exit 0

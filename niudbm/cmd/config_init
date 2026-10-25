@@ -1,0 +1,17 @@
+#!/bin/bash
+# 配置变更前置：记录当前授权目录，便于后续比对
+set -u
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_config.log}"
+exec >> "$LOG" 2>&1
+
+say() { echo "[$(date '+%F %T')] [config_init] $*"; }
+
+ETC="${TRIM_PKGETC:-/var/apps/niudbm/etc}"
+mkdir -p "$ETC" 2>/dev/null
+
+printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS:-}" > "$ETC/authorized_paths.pending" 2>/dev/null
+
+say "accessible_paths=${TRIM_DATA_ACCESSIBLE_PATHS:-空}"
+say "ok"
+exit 0
