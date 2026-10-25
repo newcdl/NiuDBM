@@ -10,7 +10,7 @@
 >
 > 平台依据：飞牛应用开放平台公开文档（manifest、fnpack、config/privilege、config/resource、开放 API 概述）。平台字段与版本会持续迭代，落地前以官方最新文档实测为准。
 >
-> 配套文档：[权限与平台核对清单](./权限与平台核对清单.md) ｜ [引擎分发与版本策略](./引擎分发与版本策略.md) ｜ [UI 信息架构与关键流程](./UI信息架构与关键流程.md)
+> 配套文档：[权限与平台核对清单](./权限与平台核对清单.md) ｜ [引擎分发与版本策略](./引擎分发与版本策略.md) ｜ [UI 信息架构与关键流程](./UI信息架构与关键流程.md) ｜ [数据模型与接口契约](./数据模型与接口契约.md)
 
 ---
 
@@ -286,7 +286,9 @@ UI 向导 → 接入层鉴权 → 实例模块做**四重预检**（端口占用
 
 ### 4.4 元数据模型（SQLite 主要表）
 
-`instances`（实例台账与状态）、`databases`（库清单）、`accounts`（账号与凭据引用）、`grants`（授权矩阵）、`backup_policies`、`backup_records`、`jobs`（任务与重试）、`metrics_samples`（采样时序）、`audit_logs`、`settings`、`schema_migrations`。
+`instances`（实例台账与状态）、`instance_members`（NAS 用户可见性授权）、`databases`（库清单）、`accounts`（账号与凭据引用）、`grants`（授权矩阵）、`backup_policies`、`backup_records`、`engine_bundles`（已装引擎包）、`jobs`（任务与重试）、`metrics_samples`（采样时序）、`audit_logs`、`secrets`（凭据密文）、`settings`、`schema_migrations`。
+
+字段级定义、状态机、错误码分段与接口契约见 [数据模型与接口契约](./数据模型与接口契约.md)。
 
 ### 4.5 引擎抽象层能力矩阵
 
