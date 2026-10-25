@@ -34,9 +34,9 @@ cat > "$ETC/settings.json" <<'JSON'
 JSON
 
 # 安装完成立即产出首份平台自检报告，便于对照核对清单
-DIAG="$TARGET/server/diagnose.sh"
-if [ -f "$DIAG" ]; then
-  /bin/bash "$DIAG" > "$VAR/diagnose-report.txt" 2>/dev/null \
+DIAG="$TARGET/niudbm"
+if [ -x "$DIAG" ]; then
+  "$DIAG" --diag > "$VAR/diagnose-report.txt" 2>&1 \
     || say "WARN: 诊断报告生成失败（不影响安装）"
 fi
 

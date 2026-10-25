@@ -1,5 +1,4 @@
 {
-  "url": "/cgi/ThirdParty/niudbm/index.cgi",
-  "type": "iframe",
-  "title": "牛库管家"
+  "gatewayPrefix": "/app/niudbm",
+  "gatewaySocket": "app.sock"
 }

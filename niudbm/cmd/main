@@ -1,13 +1,17 @@
 #!/bin/bash
 # 生命周期入口：main start | stop | status
-# 骨架阶段以心跳进程代替真实服务，用于验证平台对 start/stop/status 的调用与退出码语义
+# start 时拉起 target/niudbm，监听 target/app.sock，由统一网关转发 /app/niudbm
 set -u
 
 APP="niudbm"
 VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
-PIDF="$VAR/heartbeat.pid"
-HB="$VAR/heartbeat"
-mkdir -p "$VAR" 2>/dev/null
+DEST="${TRIM_APPDEST:-/var/apps/$APP/target}"
+BIN="$DEST/niudbm"
+SOCK="$DEST/app.sock"
+PIDF="$VAR/server.pid"
+LOG="$VAR/logs/server.log"
+
+mkdir -p "$VAR/logs" 2>/dev/null
 
 is_running() {
   [ -f "$PIDF" ] || return 1
@@ -17,35 +21,71 @@ is_running() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# 等到 socket 可连接再返回，避免应用中心刚点完就打开页面出现空窗
+wait_ready() {
+  local i=0
+  while [ "$i" -lt 60 ]; do
+    [ -S "$SOCK" ] && return 0
+    is_running || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 start() {
   if is_running; then
     echo "already running (pid=$(cat "$PIDF"))"
     return 0
   fi
-  nohup /bin/bash -c 'while :; do date +%s > "$1/heartbeat"; sleep 30; done' \
-    niudbm_heartbeat "$VAR" >/dev/null 2>&1 &
+  if [ ! -x "$BIN" ]; then
+    echo "找不到可执行文件：$BIN" >&2
+    return 1
+  fi
+
+  rm -f "$SOCK" "$PIDF" 2>/dev/null
+  nohup "$BIN" --socket "$SOCK" >> "$LOG" 2>&1 &
   echo $! > "$PIDF"
-  date +%s > "$HB"
-  echo "started pid=$(cat "$PIDF")"
-  return 0
+
+  if wait_ready; then
+    echo "started pid=$(cat "$PIDF") socket=$SOCK"
+    return 0
+  fi
+
+  echo "启动失败，最近日志：" >&2
+  tail -n 8 "$LOG" >&2 2>/dev/null
+  rm -f "$PIDF" 2>/dev/null
+  return 1
 }
 
 stop() {
   if ! is_running; then
-    rm -f "$PIDF" 2>/dev/null
+    rm -f "$PIDF" "$SOCK" 2>/dev/null
     echo "already stopped"
     return 0
   fi
-  kill "$(cat "$PIDF")" 2>/dev/null
-  sleep 1
-  rm -f "$PIDF" 2>/dev/null
+
+  local pid i=0
+  pid="$(cat "$PIDF")"
+  kill -TERM "$pid" 2>/dev/null
+
+  # 给优雅退出留 5 秒；超时则强制结束，确保不留残留
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+  fi
+
+  rm -f "$PIDF" "$SOCK" 2>/dev/null
   echo "stopped"
   return 0
 }
 
 case "${1:-status}" in
-  start)  start ;;
-  stop)   stop ;;
+  start) start ;;
+  stop)  stop ;;
   status)
     if is_running; then
       echo "running"

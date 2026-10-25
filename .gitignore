@@ -13,10 +13,12 @@
 *.log
 tmp/
 
-# 构建产物（fpk 安装包不进版本库）
-dist/
-build/
-out/
+# 构建产物（fpk 安装包、交叉编译的二进制、中间目录）
+# 注意：只忽略仓库根目录下的 dist，server/internal/webui/dist 是需入库的前端产物
+/dist/
+/build/
+/out/
+/.build/
 *.fpk
 *.tgz
 

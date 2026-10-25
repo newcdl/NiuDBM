@@ -15,9 +15,9 @@ TARGET="${TRIM_APPDEST:-/var/apps/$APP/target}"
 printf '%s\n' "${TRIM_DATA_ACCESSIBLE_PATHS:-}" > "$ETC/authorized_paths" 2>/dev/null
 rm -f "$ETC/authorized_paths.pending" 2>/dev/null
 
-DIAG="$TARGET/server/diagnose.sh"
-if [ -f "$DIAG" ]; then
-  /bin/bash "$DIAG" > "$VAR/diagnose-report.txt" 2>/dev/null \
+DIAG="$TARGET/niudbm"
+if [ -x "$DIAG" ]; then
+  "$DIAG" --diag > "$VAR/diagnose-report.txt" 2>&1 \
     || say "WARN: 诊断报告生成失败"
 fi
 
