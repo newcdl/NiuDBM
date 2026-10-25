@@ -3,18 +3,28 @@ package httpapi
 
 import (
 	"bytes"
-	"encoding/json"
 	"io/fs"
 	"log"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"niudbm/server/internal/diag"
+	"niudbm/server/internal/engine"
 	"niudbm/server/internal/platform"
+	"niudbm/server/internal/store"
 	"niudbm/server/internal/webui"
 )
+
+// Paths 是服务端会用到的全部落盘位置，启动时算好，避免各处重复拼接。
+type Paths struct {
+	Instances string // 实例文件根目录
+	Backups   string // 备份额根目录（优先共享目录）
+	Trash     string // 删除但未清理的实例
+	Meta      string // 元数据库文件
+}
 
 // Server 是应用唯一的 HTTP 入口。
 type Server struct {
@@ -23,18 +33,44 @@ type Server struct {
 	dist   fs.FS
 	mux    *http.ServeMux
 	listen string
+	st     *store.Store
+	paths  Paths
+	opts   engine.Options
+	// 同一实例上的写操作、备份、恢复必须串行：恢复要删 -wal 并 rename 文件，
+	// 如果此时另一请求正在写同一个库，两边都会出错。键是实例 ID。
+	locks sync.Map
 }
 
 // New 构造服务。prefix 是网关对外前缀，例如 /app/niudbm。
-func New(env platform.Env, prefix string) *Server {
+func New(env platform.Env, prefix string, st *store.Store, paths Paths) *Server {
 	s := &Server{
 		env:    env,
 		prefix: strings.TrimSuffix(prefix, "/"),
 		dist:   webui.Dist(),
+		st:     st,
+		paths:  paths,
+		opts:   engine.DefaultOptions(),
 	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/diag", s.handleDiag)
+
+	mux.HandleFunc("GET /api/v1/instances", s.handleListInstances)
+	mux.HandleFunc("POST /api/v1/instances", s.handleCreateInstance)
+	mux.HandleFunc("GET /api/v1/instances/{id}", s.handleGetInstance)
+	mux.HandleFunc("PATCH /api/v1/instances/{id}", s.handleUpdateInstance)
+	mux.HandleFunc("DELETE /api/v1/instances/{id}", s.handleDeleteInstance)
+	mux.HandleFunc("GET /api/v1/instances/{id}/schema", s.handleSchema)
+	mux.HandleFunc("POST /api/v1/instances/{id}/query", s.handleQuery)
+
+	mux.HandleFunc("GET /api/v1/instances/{id}/backups", s.handleListBackups)
+	mux.HandleFunc("POST /api/v1/instances/{id}/backups", s.handleCreateBackup)
+	mux.HandleFunc("POST /api/v1/instances/{id}/backups/{bid}/restore", s.handleRestoreBackup)
+	mux.HandleFunc("DELETE /api/v1/instances/{id}/backups/{bid}", s.handleDeleteBackup)
+	mux.HandleFunc("GET /api/v1/instances/{id}/backups/{bid}/download", s.handleDownloadBackup)
+
+	mux.HandleFunc("GET /api/v1/audit", s.handleListAudit)
 	mux.HandleFunc("/", s.handleStatic)
 	s.mux = mux
 	return s
@@ -42,6 +78,17 @@ func New(env platform.Env, prefix string) *Server {
 
 // SetListen 记录实际监听方式，仅用于展示。
 func (s *Server) SetListen(info string) { s.listen = info }
+
+// lockInstance 取实例级互斥锁，返回的函数用于解锁。
+func (s *Server) lockInstance(id string) func() {
+	v, _ := s.locks.LoadOrStore(id, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// SetQueryOptions 允许入口调整执行边界（测试里会缩短超时）。
+func (s *Server) SetQueryOptions(opts engine.Options) { s.opts = opts }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -79,18 +126,27 @@ func (s *Server) stripPrefix(p string) string {
 	return rest
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"version": s.env.Version,
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	total, err := s.st.CountInstances(ctx)
+	if err != nil {
+		writeErr(w, r, errInternal("读取台账失败"))
+		return
+	}
+	writeOK(w, r, map[string]any{
+		"status":    "ok",
+		"version":   s.env.Version,
+		"engine":    "sqlite",
+		"instances": total,
+		"platform":  s.env.InPlatform,
 	})
 }
 
 func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	report := diag.Run(s.env)
 	report.Env.Listen = s.listen
-	report.Env.IsAdmin = isAdmin(r)
-	writeJSON(w, http.StatusOK, report)
+	report.Env.IsAdmin = s.isAdmin(r)
+	writeOK(w, r, report)
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +166,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 未知的接口路径不能回退成前端页面，否则前端会把 HTML 当成 JSON 解析
 		if strings.HasPrefix(reqPath, "api/") {
-			writeJSON(w, http.StatusNotFound, map[string]string{"message": "接口不存在"})
+			writeErr(w, r, errNotFoundAPI())
 			return
 		}
 		// 带扩展名 = 缺失的静态资源；否则视为前端路由，交回 index
@@ -152,25 +208,6 @@ func (s *Server) assetBase() string {
 		return "/"
 	}
 	return s.prefix + "/"
-}
-
-// isAdmin 读取网关注入的身份。Header 缺失时按普通用户处理，绝不默认放行。
-func isAdmin(r *http.Request) bool {
-	switch strings.ToLower(r.Header.Get("X-Trim-Isadmin")) {
-	case "true", "1", "yes":
-		return true
-	}
-	return false
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		log.Printf("写出 JSON 失败: %v", err)
-	}
 }
 
 type statusRecorder struct {

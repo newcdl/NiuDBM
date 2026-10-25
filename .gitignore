@@ -35,3 +35,6 @@ coverage/
 # 本地环境配置
 .env
 .env.local
+
+# 本地编译缓存（docker 内 go build 用）
+.cache/

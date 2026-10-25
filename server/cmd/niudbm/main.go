@@ -17,16 +17,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"niudbm/server/internal/diag"
 	"niudbm/server/internal/httpapi"
 	"niudbm/server/internal/platform"
+	"niudbm/server/internal/store"
 )
 
 // version 由构建脚本通过 -ldflags 注入，默认值便于 go run 时区分。
-var version = "0.1.0-dev"
+var version = "0.2.0-dev"
 
 func main() {
 	socketPath := flag.String("socket", "", "Unix socket 路径（网关模式）")
@@ -47,6 +49,17 @@ func main() {
 		return
 	}
 
+	paths, err := preparePaths(env)
+	if err != nil {
+		log.Fatalf("准备目录失败: %v", err)
+	}
+
+	st, err := store.Open(paths.Meta)
+	if err != nil {
+		log.Fatalf("打开元数据库失败 %s: %v", paths.Meta, err)
+	}
+	defer st.Close()
+
 	if *socketPath == "" && *addr == "" {
 		if env.InPlatform {
 			*socketPath = filepath.Join(env.AppDest, "app.sock")
@@ -58,11 +71,10 @@ func main() {
 		*prefix = "/app/" + env.AppName
 	}
 
-	handler := httpapi.New(env, *prefix)
+	handler := httpapi.New(env, *prefix, st, paths)
 
 	var (
 		ln   net.Listener
-		err  error
 		info string
 	)
 	if *socketPath != "" {
@@ -110,6 +122,7 @@ func main() {
 	}
 
 	log.Printf("niudbm %s 监听 %s（前缀 %q）", version, info, *prefix)
+	log.Printf("实例目录 %s ｜ 备份额 %s", paths.Instances, paths.Backups)
 	if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		log.Fatalf("服务异常退出: %v", serveErr)
 	}
@@ -119,6 +132,44 @@ func main() {
 		_ = os.Remove(*socketPath)
 	}
 	log.Println("已停止")
+}
+
+// preparePaths 算出并创建全部落盘目录。
+//
+// 备份额优先放到平台分配的共享目录（用户能在文件管理器里直接看到、能随快照备份），
+// 共享目录不可用时回退到应用私有 var 下，绝不因为目录问题让服务起不来。
+func preparePaths(env platform.Env) (httpapi.Paths, error) {
+	instances := filepath.Join(env.PkgVar, "instances")
+	trash := filepath.Join(env.PkgVar, "trash")
+	meta := filepath.Join(env.PkgVar, "niudbm.db")
+
+	backups := filepath.Join(env.PkgVar, "backups")
+	for _, share := range env.DataSharePaths {
+		if !strings.Contains(filepath.Base(share), "backup") {
+			continue
+		}
+		if err := os.MkdirAll(share, 0o750); err != nil {
+			continue
+		}
+		// MkdirAll 对已存在但只读的目录也会返回 nil，必须真写一次才知道能不能用。
+		// 共享目录属主是平台给的，写不进去时默默回退到私有目录，比启动失败强。
+		probe := filepath.Join(share, ".niudbm-probe")
+		f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			continue
+		}
+		_ = f.Close()
+		_ = os.Remove(probe)
+		backups = share
+		break
+	}
+
+	for _, dir := range []string{instances, backups, trash, filepath.Dir(meta)} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return httpapi.Paths{}, fmt.Errorf("%s: %w", dir, err)
+		}
+	}
+	return httpapi.Paths{Instances: instances, Backups: backups, Trash: trash, Meta: meta}, nil
 }
 
 // writeHeartbeat 每 30 秒刷新一次心跳文件，进程被杀后心跳会自然停住。

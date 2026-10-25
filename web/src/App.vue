@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import AuditLog from './views/AuditLog.vue'
 import ComingSoon from './views/ComingSoon.vue'
 import Diagnostics from './views/Diagnostics.vue'
+import Instances from './views/Instances.vue'
 import Overview from './views/Overview.vue'
 import { useDiag } from './useDiag'
 
-type ViewKey = 'overview' | 'instances' | 'jobs' | 'settings' | 'diag'
+type ViewKey = 'overview' | 'instances' | 'audit' | 'jobs' | 'settings' | 'diag'
 
 interface NavItem {
   key: ViewKey
@@ -15,7 +17,8 @@ interface NavItem {
 
 const navs: NavItem[] = [
   { key: 'overview', label: '概览' },
-  { key: 'instances', label: '数据库', soon: true },
+  { key: 'instances', label: '数据库' },
+  { key: 'audit', label: '操作记录' },
   { key: 'jobs', label: '任务中心', soon: true },
   { key: 'settings', label: '设置', soon: true },
 ]
@@ -104,7 +107,13 @@ onMounted(() => {
           <span class="status" :class="`status-${statusKind}`">
             <i class="dot" />{{ statusText }}
           </span>
-          <button type="button" class="btn" :disabled="loading" @click="load()">
+          <button
+            v-if="current === 'overview' || current === 'diag'"
+            type="button"
+            class="btn"
+            :disabled="loading"
+            @click="load()"
+          >
             {{ loading ? '检测中' : '重新检测' }}
           </button>
         </div>
@@ -112,6 +121,8 @@ onMounted(() => {
 
       <section class="content">
         <Overview v-if="current === 'overview'" @navigate="go" />
+        <Instances v-else-if="current === 'instances'" />
+        <AuditLog v-else-if="current === 'audit'" />
         <Diagnostics v-else-if="current === 'diag'" />
         <ComingSoon v-else :name="title" />
       </section>

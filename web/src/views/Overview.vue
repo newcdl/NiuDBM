@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { api, type HealthInfo } from '../api'
 import { useDiag } from '../useDiag'
 
-const emit = defineEmits<{ navigate: [view: 'diag'] }>()
+const emit = defineEmits<{ navigate: [view: 'diag' | 'instances'] }>()
 
 const { report, loading, error, load } = useDiag()
+
+// 概览额外拉一次 health：实例数是用户最关心的一个数字，不去数据库页也能看到
+const health = ref<HealthInfo | null>(null)
 
 interface Row {
   label: string
@@ -16,6 +20,7 @@ const rows = computed<Row[]>(() => {
   if (!env) return []
   return [
     { label: '应用', value: `${env.appName} ${env.version}` },
+    { label: '数据库实例', value: health.value ? `${health.value.instances} 个` : '—' },
     { label: '运行身份', value: `${env.user}（uid=${env.uid} gid=${env.gid}）` },
     { label: '当前用户', value: env.isAdmin ? '管理员' : '普通用户' },
     { label: 'CPU 架构', value: env.arch },
@@ -27,6 +32,14 @@ const rows = computed<Row[]>(() => {
 
 const summary = computed(() => report.value?.summary ?? { pass: 0, warn: 0, fail: 0, total: 0 })
 const hasData = computed(() => report.value !== null)
+
+onMounted(async () => {
+  try {
+    health.value = await api.health()
+  } catch {
+    // 实例数只用于展示，拿不到就不显示具体数字，不打断页面
+  }
+})
 </script>
 
 <template>
@@ -72,21 +85,24 @@ const hasData = computed(() => report.value !== null)
           <p class="hint">
             共 {{ summary.total }} 项检查，覆盖目录映射、权限边界与运行身份。
           </p>
-          <button type="button" class="btn btn-primary" @click="emit('navigate', 'diag')">
-            查看明细
-          </button>
+          <div class="row actions">
+            <button type="button" class="btn" @click="emit('navigate', 'diag')">自检明细</button>
+            <button type="button" class="btn btn-primary" @click="emit('navigate', 'instances')">
+              进入数据库管理
+            </button>
+          </div>
         </section>
       </div>
 
       <section class="card note">
-        <h2>当前版本说明</h2>
+        <h2>这个版本能做什么</h2>
         <p>
-          这是 <code>0.1.0</code> 骨架包，<strong>尚不包含数据库管理功能</strong
-          >。它的用途是把平台能力逐条验证清楚：目录软链是否与变量一致、权限边界是否真的生效、生命周期退出码是否正确。
+          当前版本提供 <strong>SQLite 实例的完整管理</strong
+          >：建库、表结构浏览、SQL 控制台、一致性快照备份与一键恢复，所有写操作都有审计记录。
+          引擎随应用一起安装，不需要额外下载。
         </p>
         <p class="muted">
-          自检结果对应核对清单 P-02 / P-03 / P-05 / P-06 / P-12 / P-17 / P-19 / P-21。
-          「未通过」项处理完，才进入数据库功能开发。
+          下一阶段接入 MySQL / PostgreSQL / Redis（需下载引擎与授权校验），以及定时备份、成员权限与资源限制。
         </p>
       </section>
     </template>
@@ -182,22 +198,8 @@ const hasData = computed(() => report.value !== null)
   font-size: 12px;
 }
 
-.btn {
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-elevated);
-  font-size: 12px;
-}
-
-.btn-primary {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: #fff;
-}
-
-.btn-primary:hover {
-  opacity: 0.9;
+.actions {
+  gap: 8px;
 }
 
 .note p {
