@@ -13,6 +13,12 @@ LOG="$VAR/logs/server.log"
 
 mkdir -p "$VAR/logs" 2>/dev/null
 
+# 平台以 root 拉起脚本；数据目录必须归应用用户，否则服务能起却写不进库。
+# 每次启动做一次递归修正，代价远低于“权限不对”的排查成本。
+if [ "$(id -u)" -eq 0 ] && [ -n "${TRIM_USERNAME:-}" ] && [ -d "$VAR" ]; then
+  chown -R "$TRIM_USERNAME" "$VAR" 2>/dev/null || true
+fi
+
 is_running() {
   [ -f "$PIDF" ] || return 1
   local pid

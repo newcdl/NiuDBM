@@ -12,10 +12,17 @@ VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
 ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
 TARGET="${TRIM_APPDEST:-/var/apps/$APP/target}"
 
-if ! mkdir -p "$VAR/engines" "$VAR/instances" "$VAR/cache" "$VAR/logs" "$ETC/secrets"; then
+if ! mkdir -p "$VAR/engines" "$VAR/instances" "$VAR/backups" "$VAR/trash" "$VAR/cache" "$VAR/logs" "$ETC/secrets"; then
   say "FAIL: 无法创建数据目录"
   echo "无法创建数据目录：$VAR" >&2
   exit 1
+fi
+
+# 平台以 root 执行安装脚本，这些目录的初始属主是 root；
+# 服务以 config/privilege 里声明的应用用户运行，不交过去就写不进去。
+RUN_USER="${TRIM_USERNAME:-niudbm}"
+if [ "$(id -u)" -eq 0 ] && id "$RUN_USER" >/dev/null 2>&1; then
+  chown -R "$RUN_USER" "$VAR" "$ETC" 2>/dev/null || say "WARN: 目录属主修复失败"
 fi
 
 # 凭据目录只允许应用用户访问

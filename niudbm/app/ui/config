@@ -1,4 +1,14 @@
 {
-  "gatewayPrefix": "/app/niudbm",
-  "gatewaySocket": "app.sock"
+  ".url": {
+    "niudbm.main": {
+      "title": "牛库管家",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/niudbm",
+      "gatewaySocket": "app.sock",
+      "url": "/app/niudbm",
+      "allUsers": true
+    }
+  }
 }
