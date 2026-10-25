@@ -85,7 +85,7 @@ onMounted(load)
         </thead>
         <tbody>
           <tr v-for="it in items" :key="it.id">
-            <td class="mono small">{{ formatTime(it.ts) }}</td>
+            <td class="mono small time">{{ formatTime(it.ts) }}</td>
             <td>{{ it.username || it.userId || '系统' }}</td>
             <td>
               <div>{{ actionText(it.action) }}</div>
@@ -139,6 +139,11 @@ onMounted(load)
 
 .detail {
   max-width: 380px;
-  word-break: break-all;
+  /* 断行优先在空格与分隔符处，避免把 ULID 从中间切断 */
+  overflow-wrap: break-word;
+}
+
+.time {
+  white-space: nowrap;
 }
 </style>

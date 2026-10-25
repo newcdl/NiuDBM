@@ -161,15 +161,16 @@ onMounted(load)
       </nav>
 
       <SchemaPanel v-if="tab === 'schema'" :instance-id="instanceId" />
-      <SqlConsole v-else-if="tab === 'sql'" :instance-id="instanceId" @executed="load()" />
+      <!-- SQL 控制台常驻（v-show）：切到别的 tab 再回来，已输入的语句与结果都还在 -->
+      <SqlConsole v-show="tab === 'sql'" :instance-id="instanceId" @executed="load()" />
       <BackupPanel
-        v-else-if="tab === 'backups'"
+        v-if="tab === 'backups'"
         :instance-id="instanceId"
         :instance-name="title"
         @changed="load()"
       />
 
-      <div v-else class="danger">
+      <div v-if="tab === 'danger'" class="danger">
         <section class="card">
           <h2>实例信息</h2>
           <dl class="kv">

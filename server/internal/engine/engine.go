@@ -383,10 +383,12 @@ func Restore(backupPath, dataPath string) error {
 	return nil
 }
 
-// Size 返回实例占用（主文件 + WAL + SHM）。
+// Size 返回实例占用（主文件 + WAL）。
 func Size(path string) int64 {
 	var total int64
-	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+	// 只算主库与 -wal：-shm 是共享内存索引（固定 32KB），不计入数据体积，
+	// 否则同一实例的体积会在几十 KB 之间来回跳，看着像数据在变。
+	for _, p := range []string{path, path + "-wal"} {
 		if fi, err := os.Stat(p); err == nil {
 			total += fi.Size()
 		}

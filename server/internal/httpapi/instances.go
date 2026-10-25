@@ -63,11 +63,7 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]instanceView, 0, len(list))
 	for _, in := range list {
-		items = append(items, instanceView{
-			Instance:  in,
-			SizeBytes: engine.Size(s.dataFile(in)),
-			FilePath:  s.dataFile(in),
-		})
+		items = append(items, s.view(in))
 	}
 	writeOK(w, r, map[string]any{"items": items, "total": len(items)})
 }
@@ -141,12 +137,7 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, id, "instance.create", "instance", instID, "ok", detail)
 
-	v := instanceView{Instance: in, SizeBytes: engine.Size(dataFile), FilePath: dataFile}
-	count := 0
-	v.TableCount = &count
-	if tables, err := engine.Inspect(dataFile); err == nil {
-		count = len(tables)
-	}
+	v := s.view(in)
 	writeCreated(w, r, v)
 }
 
@@ -159,13 +150,19 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	v := s.view(in)
+	writeOK(w, r, v)
+}
+
+// view 把台账记录补上体积与表数量；列表、详情、创建共用同一套算法，避免各处算法不一致。
+func (s *Server) view(in store.Instance) instanceView {
 	dataFile := s.dataFile(in)
 	v := instanceView{Instance: in, SizeBytes: engine.Size(dataFile), FilePath: dataFile}
 	if tables, err := engine.Inspect(dataFile); err == nil {
 		n := len(tables)
 		v.TableCount = &n
 	}
-	writeOK(w, r, v)
+	return v
 }
 
 func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {

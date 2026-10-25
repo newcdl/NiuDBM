@@ -138,6 +138,10 @@ func TestInstanceLifecycle(t *testing.T) {
 	if listData.Total != 1 || listData.Items[0].ID != id {
 		t.Fatalf("列表不对：%+v", listData)
 	}
+	// 列表页要直接显示表数量，不能只在详情里算
+	if tc := listData.Items[0].TableCount; tc == nil || *tc != 1 {
+		t.Fatalf("列表应带表数量：%+v", listData.Items[0])
+	}
 
 	// 3. SQL 控制台：写
 	writeResp := e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/query", map[string]any{
