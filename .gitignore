@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+._*
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件与日志
+*.tmp
+*.log
+tmp/
+
+# 构建产物（fpk 安装包不进版本库）
+dist/
+build/
+out/
+*.fpk
+*.tgz
+
+# Go
+bin/
+*.test
+*.out
+
+# 前端
+node_modules/
+.vite/
+coverage/
+
+# 本地环境配置
+.env
+.env.local
