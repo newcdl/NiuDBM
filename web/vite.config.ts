@@ -17,8 +17,19 @@ export default defineConfig({
   build: {
     outDir: OUT_DIR,
     emptyOutDir: true,
-    // 单文件体积可控，不做过度拆分，减少网关下的请求数
-    chunkSizeWarningLimit: 800,
+    // Element Plus 全量引入后体积不小，单独成包让业务代码改动时还能吃缓存
+    chunkSizeWarningLimit: 1100,
+    rollupOptions: {
+      output: {
+        manualChunks(id: string): string | undefined {
+          if (id.includes('node_modules/element-plus') || id.includes('node_modules/@element-plus')) {
+            return 'element-plus'
+          }
+          if (id.includes('node_modules/@vue') || id.includes('node_modules/vue')) return 'vue'
+          return undefined
+        },
+      },
+    },
   },
   server: {
     port: 5173,

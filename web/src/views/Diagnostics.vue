@@ -14,6 +14,12 @@ const generatedAt = computed<string>(() => {
   return date.toLocaleString('zh-CN', { hour12: false })
 })
 
+const LEVEL_TAG: Record<Level, 'success' | 'warning' | 'danger'> = {
+  pass: 'success',
+  warn: 'warning',
+  fail: 'danger',
+}
+
 function levelText(level: Level): string {
   return LEVEL_TEXT[level]
 }
@@ -21,15 +27,19 @@ function levelText(level: Level): string {
 
 <template>
   <div class="page">
-    <div v-if="error" class="notice notice-bad">
-      <div>
-        <strong>自检未完成</strong>
-        <p>{{ error }}</p>
-      </div>
-      <button type="button" class="btn" @click="load()">重试</button>
-    </div>
+    <el-alert v-if="error" type="error" :closable="false" show-icon>
+      <template #title>
+        <div class="alert-row">
+          <div>
+            <strong>自检未完成</strong>
+            <p class="alert-detail">{{ error }}</p>
+          </div>
+          <el-button size="small" @click="load()">重试</el-button>
+        </div>
+      </template>
+    </el-alert>
 
-    <div v-else-if="loading && groups.length === 0" class="notice">正在检测…</div>
+    <el-skeleton v-else-if="loading && groups.length === 0" :rows="5" animated />
 
     <template v-else>
       <p class="meta">
@@ -38,21 +48,21 @@ function levelText(level: Level): string {
         <span>结果来自服务端实时检测，非缓存</span>
       </p>
 
-      <section v-for="group in groups" :key="group.name" class="group">
-        <h2>{{ group.name }}</h2>
-        <ul class="list">
-          <li v-for="item in group.items" :key="item.id" class="item" :class="`lv-${item.level}`">
-            <span class="badge">{{ levelText(item.level) }}</span>
-            <div class="body">
-              <div class="head">
-                <strong>{{ item.name }}</strong>
-                <code v-if="item.ref" class="ref">{{ item.ref }}</code>
-              </div>
-              <p class="detail">{{ item.detail }}</p>
+      <el-card v-for="group in groups" :key="group.name" shadow="never" class="group">
+        <template #header>{{ group.name }}</template>
+        <div v-for="item in group.items" :key="item.id" class="item">
+          <el-tag class="badge" size="small" :type="LEVEL_TAG[item.level]" effect="light">
+            {{ levelText(item.level) }}
+          </el-tag>
+          <div class="body">
+            <div class="head">
+              <strong>{{ item.name }}</strong>
+              <el-tag v-if="item.ref" size="small" type="info" effect="plain" class="ref">{{ item.ref }}</el-tag>
             </div>
-          </li>
-        </ul>
-      </section>
+            <p class="detail" :class="{ bad: item.level === 'fail' }">{{ item.detail }}</p>
+          </div>
+        </div>
+      </el-card>
     </template>
   </div>
 </template>
@@ -61,42 +71,37 @@ function levelText(level: Level): string {
 .page {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  max-width: 880px;
+  gap: 16px;
+  max-width: 1100px;
+  margin: 0 auto;
 }
 
 .meta {
   margin: 0;
   color: var(--fg-muted);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .dot-sep {
   margin: 0 6px;
 }
 
-.group h2 {
-  margin: 0 0 8px;
-  font-size: 12px;
-  font-weight: 600;
+.group :deep(.el-card__header) {
+  padding: 10px 16px;
   color: var(--fg-muted);
+  font-size: 13px;
+  font-weight: 600;
   letter-spacing: 0.02em;
 }
 
-.list {
-  margin: 0;
+.group :deep(.el-card__body) {
   padding: 0;
-  list-style: none;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  overflow: hidden;
 }
 
 .item {
   display: flex;
   gap: 12px;
-  padding: 11px 14px;
+  padding: 11px 16px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -108,25 +113,7 @@ function levelText(level: Level): string {
   flex: none;
   align-self: flex-start;
   min-width: 52px;
-  padding: 2px 8px;
-  border-radius: 20px;
-  font-size: 11px;
-  text-align: center;
-}
-
-.lv-pass .badge {
-  background: var(--ok-bg);
-  color: var(--ok);
-}
-
-.lv-warn .badge {
-  background: var(--warn-bg);
-  color: var(--warn);
-}
-
-.lv-fail .badge {
-  background: var(--bad-bg);
-  color: var(--bad);
+  justify-content: center;
 }
 
 .body {
@@ -137,60 +124,42 @@ function levelText(level: Level): string {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .head strong {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
 }
 
 .ref {
-  padding: 0 5px;
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--fg-muted);
+  font-family: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10px;
 }
 
 .detail {
   margin: 2px 0 0;
   color: var(--fg-muted);
-  font-size: 12px;
+  font-size: 13px;
+  line-height: 1.7;
   word-break: break-word;
 }
 
-.lv-fail .detail {
+.detail.bad {
   color: var(--bad);
 }
 
-.notice {
+.alert-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  font-size: 13px;
+  width: 100%;
 }
 
-.notice p {
-  margin: 4px 0 0;
+.alert-detail {
+  margin: 2px 0 0;
   color: var(--fg-muted);
-  font-size: 12px;
-}
-
-.notice-bad {
-  border-color: var(--bad);
-  background: var(--bad-bg);
-}
-
-.btn {
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg-elevated);
-  font-size: 12px;
+  font-size: 13px;
 }
 </style>

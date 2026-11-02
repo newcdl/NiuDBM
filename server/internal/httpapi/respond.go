@@ -66,6 +66,11 @@ func writeCreated(w http.ResponseWriter, r *http.Request, data any) {
 	writeEnvelope(w, r, http.StatusCreated, envelope{Message: "已创建", Data: data})
 }
 
+// writeAccepted 用于"已经收下，后台继续做"的场景：引擎下载/导入都是这种。
+func writeAccepted(w http.ResponseWriter, r *http.Request, data any) {
+	writeEnvelope(w, r, http.StatusAccepted, envelope{Message: "已受理", Data: data})
+}
+
 func writeErr(w http.ResponseWriter, r *http.Request, err apiErr) {
 	if err.Status >= http.StatusInternalServerError {
 		log.Printf("接口错误 %s %s：%s", r.Method, r.URL.Path, err.Message)
@@ -88,10 +93,14 @@ func writeEnvelope(w http.ResponseWriter, r *http.Request, status int, env envel
 
 // decodeJSON 读取请求体；空体视为合法（用于 DELETE 之类只有查询参数的接口）。
 func decodeJSON(r *http.Request, dst any) error {
+	return decodeJSONLimit(r, dst, 1<<20)
+}
+
+func decodeJSONLimit(r *http.Request, dst any, limit int64) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return errBadRequest("请求体不是合法 JSON：" + err.Error())

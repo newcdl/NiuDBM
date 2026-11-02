@@ -8,14 +8,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"niudbm/server/internal/engine"
 	"niudbm/server/internal/platform"
 	"niudbm/server/internal/store"
+	"niudbm/server/internal/ulid"
 )
 
 type apiResp struct {
@@ -26,8 +25,12 @@ type apiResp struct {
 }
 
 type testEnv struct {
-	srv   *httptest.Server
-	paths Paths
+	srv     *httptest.Server
+	paths   Paths
+	st      *store.Store
+	handler *Server
+	// 假实例用的端口计数器：同一次测试里每个实例都要有独立端口
+	nextPort int
 }
 
 func newTestEnv(t *testing.T, inPlatform bool) *testEnv {
@@ -50,13 +53,13 @@ func newTestEnv(t *testing.T, inPlatform bool) *testEnv {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	env := platform.Env{AppName: "niudbm", Version: "0.1.0-test", InPlatform: inPlatform, PkgVar: root}
+	env := platform.Env{AppName: "niudbm", Version: "0.1.0-test", InPlatform: inPlatform, PkgVar: root,
+		AppDest: filepath.Join(root, "app")}
 	handler := New(env, "/app/niudbm", st, paths)
-	handler.SetQueryOptions(engine.Options{Timeout: 5 * time.Second, MaxRows: 50})
 
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return &testEnv{srv: srv, paths: paths}
+	return &testEnv{srv: srv, paths: paths, st: st, handler: handler, nextPort: portPoolMin}
 }
 
 // call 发一个请求；headers 为 nil 时按管理员处理（开发模式）。
@@ -106,189 +109,45 @@ func (e *testEnv) must(t *testing.T, want int, method, path string, body any) ap
 	return resp
 }
 
-func TestInstanceLifecycle(t *testing.T) {
-	e := newTestEnv(t, false)
-
-	// 1. 创建（带多语句初始化脚本）
-	resp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{
-		"name":    "博客库",
-		"profile": "low",
-		"seedSql": "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);" +
-			"INSERT INTO posts (title) VALUES ('第一篇');",
-	})
-	var created instanceView
-	if err := json.Unmarshal(resp.Data, &created); err != nil {
-		t.Fatalf("创建返回无法解析：%v", err)
+// seedInstance 直接往台账塞一条 MySQL 实例记录。
+//
+// 接口测试不该真的起容器：拉镜像要几分钟，还依赖 NAS 上的 Docker。
+// 需要"实例存在"的用例统一用这条记录，只验证接口契约与参数校验。
+func (e *testEnv) seedInstance(t *testing.T, name, status string) store.Instance {
+	t.Helper()
+	e.nextPort++
+	now := time.Now().UnixMilli()
+	id := ulid.New()
+	in := store.Instance{
+		ID:            id,
+		Name:          name,
+		Engine:        "mysql",
+		EngineVersion: "8.4",
+		Mode:          "managed",
+		Status:        status,
+		DataDir:       id + "/mysql",
+		Profile:       "standard",
+		Port:          e.nextPort,
+		Runtime:       runtimeDocker,
+		StorageKind:   storageVolume,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
-	if created.ID == "" || created.Name != "博客库" || created.SizeBytes <= 0 {
-		t.Fatalf("创建结果字段不全：%+v", created)
+	if err := e.st.CreateInstance(t.Context(), in); err != nil {
+		t.Fatalf("写入台账失败：%v", err)
 	}
-	if created.TableCount == nil || *created.TableCount != 1 {
-		t.Fatalf("初始化脚本应建出 1 张表：%+v", created.TableCount)
+	// 密码文件要存在，否则详情里拿不到连接信息
+	if err := e.handler.writeSecret(id, "SeedPass_Only42"); err != nil {
+		t.Fatalf("写入密码失败：%v", err)
 	}
-	id := created.ID
-
-	// 2. 列表与详情
-	list := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/instances", nil)
-	var listData struct {
-		Items []instanceView `json:"items"`
-		Total int            `json:"total"`
+	if err := e.handler.writeRootSecret(id, "SeedPass_Only42"); err != nil {
+		t.Fatalf("写入 root 密码失败：%v", err)
 	}
-	_ = json.Unmarshal(list.Data, &listData)
-	if listData.Total != 1 || listData.Items[0].ID != id {
-		t.Fatalf("列表不对：%+v", listData)
-	}
-	// 列表页要直接显示表数量，不能只在详情里算
-	if tc := listData.Items[0].TableCount; tc == nil || *tc != 1 {
-		t.Fatalf("列表应带表数量：%+v", listData.Items[0])
-	}
-
-	// 3. SQL 控制台：写
-	writeResp := e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/query", map[string]any{
-		"sql": "INSERT INTO posts (title) VALUES ('第二篇')",
-	})
-	var writeRes engine.Result
-	_ = json.Unmarshal(writeResp.Data, &writeRes)
-	if writeRes.Kind != "exec" || writeRes.RowsAffected != 1 {
-		t.Fatalf("写入结果不对：%+v", writeRes)
-	}
-
-	// 4. SQL 控制台：读
-	readResp := e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/query", map[string]any{
-		"sql": "SELECT title FROM posts ORDER BY id",
-	})
-	var readRes engine.Result
-	_ = json.Unmarshal(readResp.Data, &readRes)
-	if readRes.RowCount != 2 || readRes.Rows[0][0] != "第一篇" {
-		t.Fatalf("读取结果不对：%+v", readRes)
-	}
-
-	// 5. 结构
-	schResp := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/instances/"+id+"/schema", nil)
-	var sch struct {
-		Tables []engine.Table `json:"tables"`
-	}
-	_ = json.Unmarshal(schResp.Data, &sch)
-	if len(sch.Tables) != 1 || sch.Tables[0].Rows != 2 || len(sch.Tables[0].Columns) != 2 {
-		t.Fatalf("结构信息不对：%+v", sch.Tables)
-	}
-
-	// 6. 备份
-	bkResp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances/"+id+"/backups", map[string]any{
-		"note": "第一次备份",
-	})
-	var bk store.Backup
-	_ = json.Unmarshal(bkResp.Data, &bk)
-	if bk.Status != "succeeded" || bk.SizeBytes <= 0 || bk.Checksum == "" {
-		t.Fatalf("备份结果不对：%+v", bk)
-	}
-	if _, err := os.Stat(filepath.Join(e.paths.Backups, id, bk.FileName)); err != nil {
-		t.Fatalf("备份文件不存在：%v", err)
-	}
-
-	// 7. 备份后再写一条，然后恢复
-	e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/query", map[string]any{
-		"sql": "INSERT INTO posts (title) VALUES ('第三篇')",
-	})
-
-	// 7.1 确认名不对 -> 拒绝
-	e.must(t, http.StatusBadRequest, http.MethodPost, "/api/v1/instances/"+id+"/backups/"+bk.ID+"/restore",
-		map[string]any{"confirmName": "写错了"})
-
-	// 7.2 正确恢复
-	e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/backups/"+bk.ID+"/restore",
-		map[string]any{"confirmName": "博客库"})
-
-	countResp := e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+id+"/query", map[string]any{
-		"sql": "SELECT COUNT(*) FROM posts",
-	})
-	var countRes engine.Result
-	_ = json.Unmarshal(countResp.Data, &countRes)
-	if countRes.Rows[0][0].(float64) != 2 {
-		t.Fatalf("恢复后应回到 2 行：%+v", countRes.Rows)
-	}
-
-	// 8. 备份列表应包含保护性备份
-	bkListResp := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/instances/"+id+"/backups", nil)
-	var bkList struct {
-		Items []store.Backup `json:"items"`
-	}
-	_ = json.Unmarshal(bkListResp.Data, &bkList)
-	if len(bkList.Items) != 2 {
-		t.Fatalf("应有 2 份备份（手动 + 恢复前保护），得到 %d", len(bkList.Items))
-	}
-	var hasProtective bool
-	for _, b := range bkList.Items {
-		if b.Type == "pre_restore" {
-			hasProtective = true
-		}
-	}
-	if !hasProtective {
-		t.Fatalf("缺少 pre_restore 类型的保护性备份：%+v", bkList.Items)
-	}
-
-	// 9. 下载备份
-	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/api/v1/instances/"+id+"/backups/"+bk.ID+"/download", nil)
-	res, err := e.srv.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("下载备份期望 200，得到 %d", res.StatusCode)
-	}
-	if got := res.Header.Get("Content-Disposition"); !strings.Contains(got, bk.FileName) {
-		t.Fatalf("下载文件名不对：%s", got)
-	}
-	body, _ := io.ReadAll(res.Body)
-	if int64(len(body)) != bk.SizeBytes {
-		t.Fatalf("下载体积不对：%d != %d", len(body), bk.SizeBytes)
-	}
-
-	// 10. 删除备份
-	e.must(t, http.StatusOK, http.MethodDelete, "/api/v1/instances/"+id+"/backups/"+bk.ID, nil)
-	if _, err := os.Stat(filepath.Join(e.paths.Backups, id, bk.FileName)); !os.IsNotExist(err) {
-		t.Fatalf("备份文件应已删除：%v", err)
-	}
-
-	// 11. 删除实例：确认名不符 -> 拒绝
-	e.must(t, http.StatusBadRequest, http.MethodDelete, "/api/v1/instances/"+id,
-		map[string]any{"confirmName": "错的", "keepData": false})
-
-	// 12. 删除实例：不保留数据 -> 进回收站
-	e.must(t, http.StatusOK, http.MethodDelete, "/api/v1/instances/"+id,
-		map[string]any{"confirmName": "博客库", "keepData": false})
-	trash, err := os.ReadDir(e.paths.Trash)
-	if err != nil || len(trash) != 1 {
-		t.Fatalf("回收站应有 1 项：len=%d err=%v", len(trash), err)
-	}
-
-	// 13. 列表为空，再删返回 404
-	list = e.must(t, http.StatusOK, http.MethodGet, "/api/v1/instances", nil)
-	_ = json.Unmarshal(list.Data, &listData)
-	if listData.Total != 0 {
-		t.Fatalf("删除后列表应为空：%+v", listData)
-	}
-	e.must(t, http.StatusNotFound, http.MethodDelete, "/api/v1/instances/"+id,
-		map[string]any{"confirmName": "博客库", "keepData": true})
-
-	// 14. 审计里应留下关键动作
-	auditResp := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/audit?limit=100", nil)
-	var audit struct {
-		Items []store.Audit `json:"items"`
-	}
-	_ = json.Unmarshal(auditResp.Data, &audit)
-	seen := map[string]bool{}
-	for _, a := range audit.Items {
-		seen[a.Action] = true
-	}
-	for _, want := range []string{"instance.create", "backup.create", "backup.restore", "instance.delete"} {
-		if !seen[want] {
-			t.Fatalf("审计缺少动作 %s，实际：%v", want, seen)
-		}
-	}
+	return in
 }
 
+// TestNameValidation 名字是目录名的一部分，也是 docker 容器名的一部分，
+// 必须在建任何东西之前挡住路径分隔符与怪异字符。
 func TestNameValidation(t *testing.T) {
 	e := newTestEnv(t, false)
 	cases := []string{
@@ -306,56 +165,81 @@ func TestNameValidation(t *testing.T) {
 		if code != http.StatusBadRequest {
 			t.Fatalf("名字 %q 应被拒绝，得到 %d（%s）", name, code, resp.Message)
 		}
+		if err := validateName(name); err == nil {
+			t.Fatalf("validateName(%q) 应报错", name)
+		}
 	}
 
-	// 正常名字（含中文、空格、点）应通过
-	e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "我的 数据库 v1.0"})
+	for _, name := range []string{"我的 数据库 v1.0", "shop_prod", "库-01"} {
+		if err := validateName(name); err != nil {
+			t.Fatalf("正常名字 %q 不该被拒：%v", name, err)
+		}
+	}
 }
 
+// TestDuplicateInstanceName 重名要在动手部署之前就拒掉：
+// 拉起容器几十秒之后才报"名字已存在"，用户只会白等一场。
 func TestDuplicateInstanceName(t *testing.T) {
 	e := newTestEnv(t, false)
-	e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "唯一"})
+	e.seedInstance(t, "唯一", "running")
+
 	code, resp := e.call(t, http.MethodPost, "/api/v1/instances", nil, map[string]any{"name": "唯一"})
 	if code != http.StatusBadRequest || !strings.Contains(resp.Message, "已存在") {
 		t.Fatalf("重名应被拒绝，得到 %d：%s", code, resp.Message)
 	}
 }
 
-func TestQueryGuards(t *testing.T) {
+// TestCreateRejectsNonMySQL 产品只做 MySQL：其它引擎必须明确拒绝，
+// 而不是悄悄建成一个 MySQL。
+func TestCreateRejectsNonMySQL(t *testing.T) {
 	e := newTestEnv(t, false)
-	resp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "护栏"})
-	var in instanceView
-	_ = json.Unmarshal(resp.Data, &in)
-
-	cases := []struct {
-		sql  string
-		want int
-	}{
-		{"ATTACH DATABASE '/tmp/x.db' AS x", http.StatusBadRequest},
-		{"SELECT 1; SELECT 2", http.StatusBadRequest},
-		{"PRAGMA writable_schema = 1", http.StatusBadRequest},
-		{"SELECT * FROM 不存在的表", http.StatusBadRequest},
-		{"SELECT 1", http.StatusOK},
-		{"CREATE TABLE ok (id INTEGER)", http.StatusOK},
-	}
-	for _, c := range cases {
-		code, resp := e.call(t, http.MethodPost, "/api/v1/instances/"+in.ID+"/query", nil, map[string]any{"sql": c.sql})
-		if code != c.want {
-			t.Fatalf("%q 期望 %d，得到 %d：%s", c.sql, c.want, code, resp.Message)
+	for _, engine := range []string{"sqlite", "postgres"} {
+		code, resp := e.call(t, http.MethodPost, "/api/v1/instances", nil, map[string]any{
+			"name": "别的引擎-" + engine, "engine": engine,
+		})
+		if code != http.StatusBadRequest || !strings.Contains(resp.Message, "只支持 MySQL") {
+			t.Fatalf("%s 应被拒，得到 %d：%s", engine, code, resp.Message)
 		}
 	}
 }
 
+// TestCreateRejectsUnknownVersion 版本必须是镜像清单里的 tag。
+func TestCreateRejectsUnknownVersion(t *testing.T) {
+	e := newTestEnv(t, false)
+	code, resp := e.call(t, http.MethodPost, "/api/v1/instances", nil, map[string]any{
+		"name": "版本不对", "engineVersion": "9.9",
+	})
+	if code != http.StatusBadRequest || !strings.Contains(resp.Message, "不支持这个版本") {
+		t.Fatalf("未知版本应被拒，得到 %d：%s", code, resp.Message)
+	}
+}
+
+// TestCreateValidatesUsers 建库时的账号必须在起容器之前验好：
+// 错了就直接拒，不能先花几分钟拉镜像再回滚。
+func TestCreateValidatesUsers(t *testing.T) {
+	e := newTestEnv(t, false)
+	cases := []map[string]any{
+		{"name": "短密码", "users": []map[string]any{{"name": "app", "password": "123", "level": "read"}}},
+		{"name": "坏档位", "users": []map[string]any{{"name": "app", "password": "password123", "level": "root"}}},
+		{"name": "坏用户名", "users": []map[string]any{{"name": "a b", "password": "password123", "level": "read"}}},
+	}
+	for _, body := range cases {
+		code, resp := e.call(t, http.MethodPost, "/api/v1/instances", nil, body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("%v 应被拒，得到 %d（%s）", body["name"], code, resp.Message)
+		}
+	}
+}
+
+// TestPermissionInPlatform 网关注入身份：没身份 401、普通用户只读、管理员可写。
 func TestPermissionInPlatform(t *testing.T) {
 	e := newTestEnv(t, true)
 
-	// 没有网关注入的身份：一律 401
 	code, _ := e.call(t, http.MethodGet, "/api/v1/instances", nil, nil)
 	if code != http.StatusUnauthorized {
 		t.Fatalf("无身份应 401，得到 %d", code)
 	}
 
-	// 普通用户：可读，不可写
 	user := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "普通用户"}
 	if code, _ := e.call(t, http.MethodGet, "/api/v1/instances", user, nil); code != http.StatusOK {
 		t.Fatalf("普通用户应可读，得到 %d", code)
@@ -365,13 +249,21 @@ func TestPermissionInPlatform(t *testing.T) {
 		t.Fatalf("普通用户写操作应 401，得到 %d：%s", code, resp.Message)
 	}
 
-	// 管理员：可写
+	// 管理员可写：用"不支持的引擎"作为探针，既能验证放行又不会真的起容器
 	admin := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "管理员", "X-Trim-Isadmin": "true"}
-	if code, resp := e.call(t, http.MethodPost, "/api/v1/instances", admin, map[string]any{"name": "管理员建的"}); code != http.StatusCreated {
-		t.Fatalf("管理员应可创建，得到 %d：%s", code, resp.Message)
+	code, resp = e.call(t, http.MethodPost, "/api/v1/instances", admin, map[string]any{"name": "管理员建的", "engine": "postgres"})
+	if code != http.StatusBadRequest || strings.Contains(resp.Message, "管理员") {
+		t.Fatalf("管理员应通过鉴权（业务 400 而不是 401），得到 %d：%s", code, resp.Message)
 	}
 
 	// 审计里应记录真实网关身份（审计仅管理员可读）
+	// 写操作审计只落成功的动作，这里直接塞一条，专测"记录的是网关身份"
+	if err := e.st.AddAudit(t.Context(), store.Audit{
+		Ts: time.Now().UnixMilli(), UserID: "1001", Username: "管理员",
+		Action: "instance.create", Result: "ok", Detail: "测试",
+	}); err != nil {
+		t.Fatalf("写入审计失败：%v", err)
+	}
 	auditCode, auditResp := e.call(t, http.MethodGet, "/api/v1/audit", admin, nil)
 	if auditCode != http.StatusOK {
 		t.Fatalf("管理员读审计应 200，得到 %d：%s", auditCode, auditResp.Message)
@@ -396,9 +288,10 @@ func TestHealthAndStatic(t *testing.T) {
 		Status    string `json:"status"`
 		Engine    string `json:"engine"`
 		Instances int    `json:"instances"`
+		Docker    bool   `json:"docker"`
 	}
 	_ = json.Unmarshal(resp.Data, &health)
-	if health.Status != "ok" || health.Engine != "sqlite" {
+	if health.Status != "ok" || health.Engine != "mysql" {
 		t.Fatalf("健康检查不对：%+v", health)
 	}
 
@@ -424,11 +317,63 @@ func TestHealthAndStatic(t *testing.T) {
 	}
 }
 
+// TestImagesList 镜像清单是部署版本的唯一来源，必须带上架构与本地状态。
+func TestImagesList(t *testing.T) {
+	e := newTestEnv(t, false)
+	resp := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/images", nil)
+	var out struct {
+		Items    []map[string]any `json:"items"`
+		Arch     string           `json:"arch"`
+		DockerOK bool             `json:"dockerOk"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) == 0 || out.Arch == "" {
+		t.Fatalf("镜像清单不该为空：%+v", out)
+	}
+}
+
+// TestDeployLogGuards 部署日志是管理员排障用的，未知实例要 404、非管理员要 401。
+func TestDeployLogGuards(t *testing.T) {
+	e := newTestEnv(t, false)
+	code, _ := e.call(t, http.MethodGet, "/api/v1/instances/NOPE/deploy-log", nil, nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("未知实例应 404，得到 %d", code)
+	}
+
+	in := e.seedInstance(t, "正常实例", "running")
+	resp := e.must(t, http.StatusOK, http.MethodGet, "/api/v1/instances/"+in.ID+"/deploy-log", nil)
+	var body struct {
+		Available bool   `json:"available"`
+		Message   string `json:"message"`
+	}
+	_ = json.Unmarshal(resp.Data, &body)
+	if body.Available || body.Message == "" {
+		t.Fatalf("没有部署失败过时应说明没有日志：%+v", body)
+	}
+
+	platform := newTestEnv(t, true)
+	user := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "普通用户"}
+	if code, _ := platform.call(t, http.MethodGet, "/api/v1/instances/NOPE/deploy-log", user, nil); code != http.StatusUnauthorized {
+		t.Fatalf("普通用户读部署日志应 401，得到 %d", code)
+	}
+}
+
+// TestUsersNeedRunningInstance 停着的实例读不到账号表：要回一条能照做的错误。
+func TestUsersNeedRunningInstance(t *testing.T) {
+	e := newTestEnv(t, false)
+	in := e.seedInstance(t, "停着的库", "stopped")
+	code, resp := e.call(t, http.MethodGet, "/api/v1/instances/"+in.ID+"/users", nil, nil)
+	if code != http.StatusConflict && code != http.StatusBadRequest {
+		t.Fatalf("停着的实例读账号应报状态错误，得到 %d：%s", code, resp.Message)
+	}
+}
+
+// TestBackupOfDeletedInstance 已删除的实例不能再触发备份。
 func TestBackupOfDeletedInstance(t *testing.T) {
 	e := newTestEnv(t, false)
-	resp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "待删"})
-	var in instanceView
-	_ = json.Unmarshal(resp.Data, &in)
+	in := e.seedInstance(t, "待删", "running")
 
 	e.must(t, http.StatusOK, http.MethodDelete, "/api/v1/instances/"+in.ID,
 		map[string]any{"confirmName": "待删", "keepData": true})
@@ -439,40 +384,14 @@ func TestBackupOfDeletedInstance(t *testing.T) {
 	}
 }
 
+// TestRestoreRejectsMissingBackup 不存在的备份不能进入恢复流程。
 func TestRestoreRejectsMissingBackup(t *testing.T) {
 	e := newTestEnv(t, false)
-	resp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "无备份"})
-	var in instanceView
-	_ = json.Unmarshal(resp.Data, &in)
+	in := e.seedInstance(t, "无备份", "running")
 
 	code, _ := e.call(t, http.MethodPost, "/api/v1/instances/"+in.ID+"/backups/NOPE/restore",
 		nil, map[string]any{"confirmName": "无备份"})
 	if code != http.StatusNotFound {
 		t.Fatalf("不存在的备份应 404，得到 %d", code)
-	}
-}
-
-func TestQueryLimitParam(t *testing.T) {
-	e := newTestEnv(t, false)
-	resp := e.must(t, http.StatusCreated, http.MethodPost, "/api/v1/instances", map[string]any{"name": "限量"})
-	var in instanceView
-	_ = json.Unmarshal(resp.Data, &in)
-
-	e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+in.ID+"/query", map[string]any{
-		"sql": "CREATE TABLE t (id INTEGER)",
-	})
-	for i := 0; i < 5; i++ {
-		e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+in.ID+"/query", map[string]any{
-			"sql": "INSERT INTO t (id) VALUES (" + strconv.Itoa(i) + ")",
-		})
-	}
-
-	resp = e.must(t, http.StatusOK, http.MethodPost, "/api/v1/instances/"+in.ID+"/query", map[string]any{
-		"sql": "SELECT id FROM t", "limit": 2,
-	})
-	var res engine.Result
-	_ = json.Unmarshal(resp.Data, &res)
-	if res.RowCount != 2 || !res.Truncated {
-		t.Fatalf("limit=2 应截断：%+v", res)
 	}
 }

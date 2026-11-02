@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,7 +29,7 @@ import (
 )
 
 // version 由构建脚本通过 -ldflags 注入，默认值便于 go run 时区分。
-var version = "0.2.0-dev"
+var version = "0.1.12-dev"
 
 func main() {
 	socketPath := flag.String("socket", "", "Unix socket 路径（网关模式）")
@@ -73,6 +74,22 @@ func main() {
 
 	handler := httpapi.New(env, *prefix, st, paths)
 
+	// 容器状态与台账在平台重启后可能不一致（例如部署到一半被重启），
+	// 启动时对齐一遍。放到后台做：容器初始化慢也不能堵住 socket 监听，
+	// 否则网关会认为应用没起来。
+	var bg sync.WaitGroup
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		handler.Reconcile(context.Background())
+	}()
+
+	// 定时备份与巡检：到期备份、保留清理、实例掉线通知都靠这个循环。
+	// 生命周期跟进程走，退出时先取消，避免关闭过程中又启动新的备份。
+	schedCtx, schedCancel := context.WithCancel(context.Background())
+	defer schedCancel()
+	handler.StartScheduler(schedCtx)
+
 	var (
 		ln   net.Listener
 		info string
@@ -109,11 +126,16 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		log.Printf("收到信号 %s，开始关闭", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		schedCancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		// 先等自动拉起收尾，避免“刚起来就被停掉”留下半启动的实例
+		bg.Wait()
 		if shutErr := srv.Shutdown(ctx); shutErr != nil {
 			log.Printf("关闭超时，强制退出: %v", shutErr)
 		}
+		// 数据库进程是我们拉起的，不主动停就会变成孤儿进程占着端口
+		handler.Shutdown(ctx)
 	}()
 
 	// 平台内才写心跳：供自检判断服务是否真的活着（P-21）
@@ -141,6 +163,8 @@ func main() {
 func preparePaths(env platform.Env) (httpapi.Paths, error) {
 	instances := filepath.Join(env.PkgVar, "instances")
 	trash := filepath.Join(env.PkgVar, "trash")
+	// 实例密码单独放 etc 下且不给组外读权限：备份目录是共享目录，密码绝不能落在那里
+	secrets := filepath.Join(env.PkgEtc, "secrets")
 	meta := filepath.Join(env.PkgVar, "niudbm.db")
 
 	backups := filepath.Join(env.PkgVar, "backups")
@@ -164,12 +188,16 @@ func preparePaths(env platform.Env) (httpapi.Paths, error) {
 		break
 	}
 
-	for _, dir := range []string{instances, backups, trash, filepath.Dir(meta)} {
+	for _, dir := range []string{instances, backups, trash, secrets, filepath.Dir(meta)} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return httpapi.Paths{}, fmt.Errorf("%s: %w", dir, err)
 		}
 	}
-	return httpapi.Paths{Instances: instances, Backups: backups, Trash: trash, Meta: meta}, nil
+	// 实例根目录要可被引擎身份穿过：服务以 root 跑时，库进程是降权运行的，
+	// 父目录若 0750 root:root，它连自己的数据目录都进不去。
+	_ = os.Chmod(instances, 0o755)
+	_ = os.Chmod(secrets, 0o700)
+	return httpapi.Paths{Instances: instances, Backups: backups, Trash: trash, Secrets: secrets, Meta: meta}, nil
 }
 
 // writeHeartbeat 每 30 秒刷新一次心跳文件，进程被杀后心跳会自然停住。

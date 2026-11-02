@@ -12,7 +12,7 @@ VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
 ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
 TARGET="${TRIM_APPDEST:-/var/apps/$APP/target}"
 
-if ! mkdir -p "$VAR/engines" "$VAR/instances" "$VAR/backups" "$VAR/trash" "$VAR/cache" "$VAR/logs" "$ETC/secrets"; then
+if ! mkdir -p "$VAR/instances" "$VAR/backups" "$VAR/trash" "$VAR/cache" "$VAR/logs" "$ETC/secrets"; then
   say "FAIL: 无法创建数据目录"
   echo "无法创建数据目录：$VAR" >&2
   exit 1
@@ -28,17 +28,67 @@ fi
 # 凭据目录只允许应用用户访问
 chmod 700 "$ETC/secrets" 2>/dev/null || say "WARN: secrets 目录权限设置失败"
 
+# Docker 方式要调宿主的 docker：应用以普通应用用户运行，不在 socket 属组里就是
+# permission denied——界面上表现为"检测不到 Docker"，而系统里的 Docker 明明在跑。
+# 安装脚本本身是 root，这里顺手把应用用户加进 socket 的属组。
+# 组名不写死：飞牛/群晖这类系统不一定叫 docker。
+add_docker_group() {
+  local sock="" grp=""
+  for s in /var/run/docker.sock /run/docker.sock; do
+    [ -S "$s" ] && sock="$s" && break
+  done
+  if [ -z "$sock" ]; then
+    say "未发现 docker.sock（未装 Docker 或未启动），跳过 docker 组授权"
+    return 0
+  fi
+  grp="$(stat -c '%G' "$sock" 2>/dev/null)"
+  if [ -z "$grp" ]; then
+    say "WARN: 读不到 $sock 的属组"
+    return 0
+  fi
+  if [ "$grp" = "root" ]; then
+    say "WARN: $sock 的属组是 root，应用用户访问不了；Docker 方式将不可用"
+    return 0
+  fi
+  if ! id "$RUN_USER" >/dev/null 2>&1; then
+    say "WARN: 应用用户 $RUN_USER 不存在，跳过 docker 组授权"
+    return 0
+  fi
+  if id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
+    say "应用用户 $RUN_USER 已在 $grp 组，无需改动"
+    return 0
+  fi
+  if usermod -aG "$grp" "$RUN_USER" 2>/dev/null || adduser "$RUN_USER" "$grp" 2>/dev/null; then
+    say "已把 $RUN_USER 加入 $grp 组（用于访问 docker.sock）"
+  else
+    say "WARN: 把 $RUN_USER 加入 $grp 组失败，Docker 方式可能不可用"
+  fi
+}
+if [ "$(id -u)" -eq 0 ]; then
+  add_docker_group
+fi
+
 printf '%s %s\n' "$(date '+%F %T')" "${TRIM_APPVER:-unknown}" > "$VAR/installed_at"
 
-# 默认配置：端口池、绑定范围、引擎源
+# 默认配置：端口池、绑定范围、诊断开关
 cat > "$ETC/settings.json" <<'JSON'
 {
   "portPool": { "start": 33000, "end": 33099 },
   "bindScope": "loopback",
-  "engineSource": "official",
   "diagnostics": { "enabled": true }
 }
 JSON
+
+# Docker 镜像加速：国内直连 Docker Hub 常在拉清单阶段就超时。
+# 只有首次安装才写：升级时保留用户自己改过的镜像站（或清空改回直连）。
+if [ ! -f "$ETC/docker.env" ]; then
+  cat > "$ETC/docker.env" <<'ENV'
+# 拉数据库镜像用的加速前缀，例如 docker.m.daocloud.io；
+# 留空表示直连 Docker Hub。加速站失败时程序会自动退回官方源。
+NIUDBM_DOCKER_MIRROR=docker.m.daocloud.io
+ENV
+  chown "$RUN_USER" "$ETC/docker.env" 2>/dev/null || say "WARN: docker.env 属主修复失败"
+fi
 
 # 安装完成立即产出首份平台自检报告，便于对照核对清单
 DIAG="$TARGET/niudbm"

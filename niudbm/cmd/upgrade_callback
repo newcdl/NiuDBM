@@ -10,8 +10,43 @@ say() { echo "[$(date '+%F %T')] [upgrade_callback] $*"; }
 APP="niudbm"
 VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
 TARGET="${TRIM_APPDEST:-/var/apps/$APP/target}"
+RUN_USER="${TRIM_USERNAME:-niudbm}"
 
 printf '%s %s\n' "$(date '+%F %T')" "${TRIM_APPVER:-unknown}" > "$VAR/installed_at"
+
+# 老版本装的时候没做这件事：应用用户不在 docker 组，读不了 /var/run/docker.sock，
+# 界面上就是"检测不到 Docker"而系统里 Docker 明明在跑。升级时补上。
+add_docker_group() {
+  local sock="" grp=""
+  for s in /var/run/docker.sock /run/docker.sock; do
+    [ -S "$s" ] && sock="$s" && break
+  done
+  if [ -z "$sock" ]; then
+    say "未发现 docker.sock，跳过 docker 组授权"
+    return 0
+  fi
+  grp="$(stat -c '%G' "$sock" 2>/dev/null)"
+  if [ -z "$grp" ] || [ "$grp" = "root" ]; then
+    say "WARN: $sock 属组为 '${grp:-未知}'，应用用户无法访问；Docker 方式将不可用"
+    return 0
+  fi
+  if ! id "$RUN_USER" >/dev/null 2>&1; then
+    say "WARN: 应用用户 $RUN_USER 不存在，跳过"
+    return 0
+  fi
+  if id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
+    say "应用用户 $RUN_USER 已在 $grp 组"
+    return 0
+  fi
+  if usermod -aG "$grp" "$RUN_USER" 2>/dev/null || adduser "$RUN_USER" "$grp" 2>/dev/null; then
+    say "已把 $RUN_USER 加入 $grp 组（用于访问 docker.sock），重启应用后生效"
+  else
+    say "WARN: 把 $RUN_USER 加入 $grp 组失败"
+  fi
+}
+if [ "$(id -u)" -eq 0 ]; then
+  add_docker_group
+fi
 
 DIAG="$TARGET/niudbm"
 if [ -x "$DIAG" ]; then

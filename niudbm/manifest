@@ -1,7 +1,7 @@
 appname=niudbm
-version=0.2.0
+version=0.1.18
 display_name=牛库管家
-desc=让 NAS 上的数据库管理像装应用一样简单。本版本提供 SQLite 实例的建库、SQL 控制台、表结构浏览、备份与恢复。
+desc=让 NAS 上的数据库管理像装应用一样简单。引擎不占安装包：PostgreSQL 16/17、MySQL（MariaDB 10.11/11.4、Oracle MySQL 8.4/8.0/latest/5.7/5.6/5.5）在应用内一键下载、离线导入，或用 Docker 镜像直接跑；建库、参数调优、账户权限、备份恢复、导入导出、任务中心、全局设置与定时备份开箱可用。
 source=thirdparty
 platform=x86
 maintainer=小柿子
@@ -15,4 +15,4 @@ ctl_stop=true
 checkport=false
 micro_app=false
 disable_authorization_path=false
-changelog=首个可用版本：SQLite 实例全生命周期管理（建库、表结构、SQL 控制台、快照备份与一键恢复），写操作审计可追溯，附平台自检页。
+changelog=新建库的字符集从 4 种扩到引擎实际支持的全部（utf8mb4 / utf8 / utf8mb3 / gb18030 / gbk / gb2312 / big5 / latin1 / utf16 / utf32 / sjis / euckr / binary 等）；── 字符集清单实时读取实例的 information_schema，不同 MySQL 与 MariaDB 版本各自列出自己真能建的；── 建库时自动挑一个跨版本稳定的排序规则，避免同一套参数在两代实例上排序行为不同；── 字符集下拉带中文说明，常用项排在最前

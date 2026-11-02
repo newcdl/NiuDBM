@@ -5,11 +5,21 @@ set -u
 
 APP="niudbm"
 VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
+ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
 DEST="${TRIM_APPDEST:-/var/apps/$APP/target}"
 BIN="$DEST/niudbm"
 SOCK="$DEST/app.sock"
 PIDF="$VAR/server.pid"
 LOG="$VAR/logs/server.log"
+
+# Docker 镜像加速：安装脚本会写 etc/docker.env，用户可以自己换成别的镜像站或清空直连。
+# 老版本升级上来的机器没有这个文件，用同一份默认值兜底。
+if [ -f "$ETC/docker.env" ]; then
+  . "$ETC/docker.env"
+else
+  NIUDBM_DOCKER_MIRROR="docker.m.daocloud.io"
+fi
+export NIUDBM_DOCKER_MIRROR
 
 mkdir -p "$VAR/logs" 2>/dev/null
 

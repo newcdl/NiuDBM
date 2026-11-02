@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,15 +10,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"niudbm/server/internal/engine"
+	"niudbm/server/internal/mysqlctl"
 	"niudbm/server/internal/store"
 	"niudbm/server/internal/ulid"
 )
 
 type backupReq struct {
 	Note string `json:"note"`
+	// Database 是这次要备份的库；留空表示服务里的默认库。
+	// 一个服务能有多个库，备份按库走，导出的 .sql 只含这一个库。
+	Database string `json:"database"`
 }
 
 type restoreReq struct {
@@ -57,17 +62,34 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 备份按库走：没有默认库可以兜底，必须点名要备份哪个库
+	dbName := strings.TrimSpace(req.Database)
+	if dbName == "" {
+		s.fail(w, r, errBadRequest("请选择要备份的库"))
+		return
+	}
+	if err := mysqlctl.ValidDBName(dbName); err != nil {
+		s.fail(w, r, errBadRequest(err.Error()))
+		return
+	}
+
 	unlock := s.lockInstance(in.ID)
 	defer unlock()
 
-	rec, err := s.makeBackup(r, in, "manual", req.Note)
+	started := time.Now()
+	rec, err := s.makeBackup(r.Context(), in, "manual", req.Note, dbName)
 	if err != nil {
 		s.audit(r, id, "backup.create", "instance", in.ID, "failed", err.Error())
+		s.recordJob(id, jobBackupCreate, "instance", in.ID, "note="+truncate(req.Note, 100), started, "", err)
 		s.fail(w, r, err)
 		return
 	}
 	s.audit(r, id, "backup.create", "backup", rec.ID, "ok",
-		fmt.Sprintf("%s，%d 字节，%s", rec.FileName, rec.SizeBytes, rec.StoragePath))
+		fmt.Sprintf("库 %s，%s，%d 字节，%s", rec.Database, rec.FileName, rec.SizeBytes, rec.StoragePath))
+	s.recordJob(id, jobBackupCreate, "instance", in.ID, "库="+rec.Database+"，note="+truncate(req.Note, 100), started,
+		rec.FileName+"（"+humanSize(rec.SizeBytes)+"）", nil)
+	// 手动备份同样受保留策略约束：不然用户"点几次备份"就把共享目录塞满了
+	s.pruneBackups(r.Context(), in.ID)
 	writeCreated(w, r, rec)
 }
 
@@ -114,16 +136,21 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	unlock := s.lockInstance(in.ID)
 	defer unlock()
 
-	// 恢复前自动留一份保护性备份，这样"点错了"也还能回去
-	protective, perr := s.makeBackup(r, in, "pre_restore", "恢复前自动备份")
+	started := time.Now()
+	// 恢复前自动留一份保护性备份，这样"点错了"也还能回去。
+	// 备份哪个库就恢复哪个库，保护性备份也只备这一个库，不做整实例备份。
+	protective, perr := s.makeBackup(r.Context(), in, "pre_restore", "恢复前自动备份", rec.Database)
 	if perr != nil {
 		s.audit(r, id, "backup.restore", "backup", rec.ID, "failed", "保护性备份失败："+perr.Error())
+		s.recordJob(id, jobBackupRestore, "instance", in.ID, "backup="+rec.FileName, started, "",
+			errBackupVerify("保护性备份失败："+perr.Error()))
 		s.fail(w, r, errBackupVerify("恢复前自动备份失败，已中止："+perr.Error()))
 		return
 	}
 
-	if err := engine.Restore(rec.StoragePath, s.dataFile(in)); err != nil {
+	if err := s.restoreInto(r, in, rec.StoragePath); err != nil {
 		s.audit(r, id, "backup.restore", "backup", rec.ID, "failed", err.Error())
+		s.recordJob(id, jobBackupRestore, "instance", in.ID, "backup="+rec.FileName, started, "", err)
 		s.fail(w, r, errBackupVerify("恢复失败："+err.Error()))
 		return
 	}
@@ -131,13 +158,26 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	_ = s.st.SetStatus(r.Context(), in.ID, "running", "")
 	s.audit(r, id, "backup.restore", "backup", rec.ID, "ok",
 		"来自 "+rec.FileName+"，保护性备份 "+protective.FileName)
+	s.recordJob(id, jobBackupRestore, "instance", in.ID, "backup="+rec.FileName, started,
+		"已恢复到 "+rec.FileName, nil)
 
 	writeOK(w, r, map[string]any{
 		"restored":         true,
 		"backupId":         rec.ID,
 		"protectiveBackup": protective,
-		"sizeBytes":        engine.Size(s.dataFile(in)),
+		"sizeBytes":        s.instanceSize(in),
 	})
+}
+
+// restoreInto 只有逻辑恢复一种：dump 文件经容器内客户端导入。
+//
+// 恢复要求实例在运行，Restore 内部会保证这一点。
+func (s *Server) restoreInto(r *http.Request, in store.Instance, src string) error {
+	spec, err := s.mysqlSpec(in)
+	if err != nil {
+		return err
+	}
+	return spec.Restore(src)
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +210,7 @@ func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, id, "backup.delete", "backup", rec.ID, "ok", rec.FileName)
+	s.recordJob(id, jobBackupDelete, "instance", in.ID, "backup="+rec.FileName, time.Now(), "已删除", nil)
 	writeOK(w, r, map[string]any{"id": rec.ID})
 }
 
@@ -199,11 +240,25 @@ func (s *Server) handleDownloadBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 // makeBackup 是备份与恢复共用的落盘流程：先落 running 记录，再执行，最后回填。
-func (s *Server) makeBackup(r *http.Request, in store.Instance, kind, note string) (store.Backup, error) {
+//
+// 入参是 ctx 而不是 request：定时备份没有 HTTP 请求，同一套流程要能被调度器直接调用。
+func (s *Server) makeBackup(ctx context.Context, in store.Instance, kind, note, database string) (store.Backup, error) {
 	bid := ulid.New()
-	// 文件名用完整 ULID：只取前几位会落在同一秒内重复（ULID 前段就是时间戳），
-	// 导致两份备份互相覆盖——手动备份与保护性备份很容易在同一秒发生。
-	fileName := fmt.Sprintf("%s-%s.db", time.Now().Format("20060102-150405"), bid)
+	// 只做逻辑备份：dump 出来是 .sql，跨版本、跨机器都能直接导入，
+	// 也不需要停容器，日常备份不会打断用户连接。
+	ext := ".sql"
+	spec, err := s.mysqlSpec(in)
+	if err != nil {
+		return store.Backup{}, errBadRequest(err.Error())
+	}
+	// 库名必须明确：服务建出来是空的，没有"默认库"可以兜底。
+	// 记录里写清真实库名，列表能看出这份备份属于哪个库，恢复时也回到这个库。
+	database = strings.TrimSpace(database)
+	if database == "" {
+		return store.Backup{}, errBadRequest("请选择要备份的库")
+	}
+	// 文件名带上库名：同一个服务下多个库的备份放在同一目录，光看时间戳分不清是谁的。
+	fileName := fmt.Sprintf("%s-%s-%s%s", time.Now().Format("20060102-150405"), sanitizeFileName(database), bid, ext)
 	dst := filepath.Join(s.paths.Backups, in.ID, fileName)
 	if _, err := os.Stat(dst); err == nil {
 		return store.Backup{}, errInternal("备份文件名冲突，请重试")
@@ -216,10 +271,11 @@ func (s *Server) makeBackup(r *http.Request, in store.Instance, kind, note strin
 		Status:      "running",
 		StoragePath: dst,
 		FileName:    fileName,
+		Database:    database,
 		Note:        truncate(note, 200),
 		StartedAt:   time.Now().UnixMilli(),
 	}
-	if err := s.st.CreateBackup(r.Context(), rec); err != nil {
+	if err := s.st.CreateBackup(ctx, rec); err != nil {
 		return store.Backup{}, errInternal("写入备份记录失败")
 	}
 
@@ -229,7 +285,7 @@ func (s *Server) makeBackup(r *http.Request, in store.Instance, kind, note strin
 			rec.Status = "failed"
 			rec.ErrorCode = "50001"
 			rec.ErrorHint = e.Error()
-			_ = s.st.FinishBackup(r.Context(), rec)
+			_ = s.st.FinishBackup(ctx, rec)
 			return rec, errBackupTarget("备份失败：" + e.Error())
 		}
 		rec.Status = "succeeded"
@@ -237,17 +293,37 @@ func (s *Server) makeBackup(r *http.Request, in store.Instance, kind, note strin
 			rec.SizeBytes = fi.Size()
 		}
 		rec.Checksum = sha256Of(dst)
-		_ = s.st.FinishBackup(r.Context(), rec)
+		_ = s.st.FinishBackup(ctx, rec)
 		return rec, nil
 	}
 
-	if err := engine.Backup(s.dataFile(in), dst); err != nil {
+	if err := spec.Backup(dst, database); err != nil {
 		return finish(err)
 	}
-	if err := engine.Verify(dst); err != nil {
+	if err := mysqlctl.Verify(dst); err != nil {
 		return finish(fmt.Errorf("备份文件校验失败：%w", err))
 	}
 	return finish(nil)
+}
+
+// sanitizeFileName 把库名压成文件名安全的形式：
+// 库名受 ValidDBName 约束，但老数据与手工导入的库名可能带别的字符，
+// 拼进路径前统一兜一层，避免把备份写到别的目录去。
+func sanitizeFileName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "db"
+	}
+	return out
 }
 
 func sha256Of(path string) string {

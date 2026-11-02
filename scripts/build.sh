@@ -2,6 +2,7 @@
 # 牛库管家构建：静态检查 → 前端构建 → 后端测试 → 双架构编译 → 组装 fpk
 #
 # 默认同时产出 amd64(x86) 与 arm64(arm) 两个包：发布必须成对，避免漏包。
+# 引擎不随包分发：数据库以 Docker 官方镜像运行，版本清单见 server/internal/images。
 # 测试不通过直接中止，不出包。
 #
 # 用法：
@@ -11,7 +12,7 @@
 #   scripts/build.sh --skip-web       跳过前端构建（产物已就绪时）
 #   scripts/build.sh --skip-test      跳过后端测试（仅本地调试，禁止用于发布）
 #   scripts/build.sh --pack           检查通过后调用 fnpack 打包
-set -u
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT/niudbm"
@@ -24,6 +25,13 @@ CACHE_DIR="$ROOT/.cache"
 # 本地无 go 时用镜像编译；可用 GO_IMAGE 覆盖
 GO_IMAGE="${GO_IMAGE:-docker.m.daocloud.io/library/golang:1.24}"
 GO_PROXY="${GO_PROXY:-https://goproxy.cn,direct}"
+# 同一个 tag 下 amd64/arm64 是两个镜像，不指定平台就会用到上次拉下来的那个。
+# 在 x86 机器上误用 arm64 工具链时，编译与测试全变成模拟执行，慢到会被误判成卡死。
+case "$(uname -m)" in
+  x86_64|amd64)  HOST_PLATFORM=linux/amd64 ;;
+  aarch64|arm64) HOST_PLATFORM=linux/arm64 ;;
+  *)             HOST_PLATFORM=linux/amd64 ;;
+esac
 
 ARCHS="all"
 DO_PACK=0
@@ -60,8 +68,8 @@ echo "牛库管家 v$VERSION · 架构 $ARCHS"
 echo
 echo "== 1. 静态检查 =="
 
-for f in "$APP_DIR"/cmd/*; do
-  [ -f "$f" ] || continue
+for f in "${APP_DIR}"/cmd/* "${ROOT}"/scripts/*.sh; do
+  [ -f "${f}" ] || continue
   if bash -n "$f" 2>/dev/null; then ok "$(basename "$f") 语法"; else bad "$(basename "$f") 语法错误"; fi
 done
 
@@ -151,7 +159,7 @@ else
   mkdir -p "$BUILD_DIR" "$CACHE_DIR"
   TEST_LOG="$BUILD_DIR/test.log"
   if command -v go >/dev/null 2>&1; then
-    if ( cd "$SERVER_DIR" && go vet -buildvcs=false ./... && go test -buildvcs=false -count=1 ./... ) >"$TEST_LOG" 2>&1; then
+    if ( cd "${SERVER_DIR}" && test -z "$(gofmt -l cmd internal)" && go vet -buildvcs=false ./... && go test -buildvcs=false -count=1 ./... ) >"$TEST_LOG" 2>&1; then
       ok "go vet + go test 全部通过（本地 go）"
       grep -E '^(ok|\?|---)' "$TEST_LOG" | sed 's/^/         /'
     else
@@ -160,10 +168,10 @@ else
       exit 1
     fi
   elif command -v docker >/dev/null 2>&1; then
-    if docker run --rm --user "$(id -u):$(id -g)" \
+    if docker run --rm --platform "${HOST_PLATFORM}" --user "$(id -u):$(id -g)" \
         -e HOME=/tmp -e GOCACHE=/cache/gocache -e GOMODCACHE=/cache/gomod -e GOPROXY="$GO_PROXY" \
         -v "$ROOT:/src" -v "$CACHE_DIR:/cache" -w /src/server "$GO_IMAGE" \
-        sh -c 'go vet -buildvcs=false ./... && go test -buildvcs=false -count=1 ./...' >"$TEST_LOG" 2>&1; then
+        sh -c 'test -z "$(gofmt -l cmd internal)" && go vet -buildvcs=false ./... && go test -buildvcs=false -count=1 ./...' >"${TEST_LOG}" 2>&1; then
       ok "go vet + go test 全部通过（${GO_IMAGE}）"
       grep -E '^(ok|\?|---)' "$TEST_LOG" | sed 's/^/         /'
     else
@@ -192,7 +200,7 @@ for arch in $ARCHS; do
     fi
   elif command -v docker >/dev/null 2>&1; then
     mkdir -p "$CACHE_DIR"
-    if docker run --rm --user "$(id -u):$(id -g)" \
+    if docker run --rm --platform "${HOST_PLATFORM}" --user "$(id -u):$(id -g)" \
         -e HOME=/tmp -e GOCACHE=/cache/gocache -e GOMODCACHE=/cache/gomod -e GOPROXY="$GO_PROXY" \
         -v "$ROOT:/src" -v "$CACHE_DIR:/cache" -w /src/server "$GO_IMAGE" \
         sh -c "CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false -ldflags '$ldflags' -o /src/dist/niudbm-linux-$arch ./cmd/niudbm"; then
@@ -226,6 +234,7 @@ for arch in $ARCHS; do
   cp "$DIST_DIR/niudbm-linux-$arch" "$pkg/app/niudbm"
   chmod 755 "$pkg/app/niudbm"
 
+  # 引擎不进包：数据库以官方镜像运行，安装包里只有程序本身
   # manifest 按架构生成，源文件始终保持默认值，避免工作区被构建污染
   sed "s/^platform=.*/platform=$platform/" "$APP_DIR/manifest" > "$pkg/manifest"
 
@@ -240,13 +249,16 @@ if [ "$SKIP_TEST" -eq 1 ]; then
 else
   for arch in $ARCHS; do
     SMOKE_LOG="$BUILD_DIR/smoke-$arch.log"
-    "$ROOT/scripts/smoke.sh" "$DIST_DIR/niudbm-linux-$arch" "$arch" >"$SMOKE_LOG" 2>&1
-    rc=$?
+    if "${ROOT}/scripts/smoke.sh" "${DIST_DIR}/niudbm-linux-${arch}" "${arch}" >"${SMOKE_LOG}" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
     if [ "$rc" -eq 0 ]; then
       ok "linux/${arch} 冒烟通过"
       sed 's/^/         /' "$SMOKE_LOG"
-    elif [ "$rc" -eq 2 ]; then
-      skip "linux/${arch} 冒烟跳过：$(head -n 1 "$SMOKE_LOG")"
+    elif [ "${rc}" -eq 2 ] && [ "${DO_PACK}" -eq 0 ]; then
+      skip "linux/${arch} 冒烟跳过：$(head -n 1 "${SMOKE_LOG}")"
     else
       echo "  [fail] linux/${arch} 冒烟失败，详见 $SMOKE_LOG" >&2
       tail -n 30 "$SMOKE_LOG" >&2
@@ -330,6 +342,13 @@ for arch in $ARCHS; do
       bad "manifest platform 不是 ${want_platform}：$(grep '^platform=' "$pkg/manifest")"
     fi
     if [ -x "$pkg/app/niudbm" ]; then ok "包内二进制可执行" ; else bad "包内 niudbm 缺少可执行位"; fi
+  fi
+
+  # 引擎应该是空的：误把引擎或镜像 tar 打进包会让安装包从 20MB 变成几百 MB
+  if [ -d "$pkg/app/engines" ] && [ -n "$(ls -A "$pkg/app/engines" 2>/dev/null)" ]; then
+    bad "包内不应包含引擎：$pkg/app/engines"
+  else
+    ok "包内不含引擎/镜像（数据库用官方镜像）"
   fi
 
 done

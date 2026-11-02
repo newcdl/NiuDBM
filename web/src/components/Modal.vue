@@ -79,7 +79,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   border: 0;
   background: transparent;
   color: var(--fg-muted);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .body {
@@ -93,5 +93,37 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
   gap: 8px;
   padding: 12px 18px;
   border-top: 1px solid var(--line);
+}
+
+/* 手机端从底部弹出，按钮等宽平铺，拇指能直接够到 */
+@media (max-width: 720px) {
+  .mask {
+    padding: 0;
+    align-items: end;
+  }
+
+  .dialog {
+    width: 100%;
+    max-height: 92vh;
+    border-radius: 16px 16px 0 0;
+    border-bottom: 0;
+  }
+
+  .head {
+    padding: 14px 16px;
+  }
+
+  .body {
+    padding: 14px 16px;
+  }
+
+  .foot {
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  :deep(.foot .btn) {
+    flex: 1;
+    min-height: 42px;
+  }
 }
 </style>

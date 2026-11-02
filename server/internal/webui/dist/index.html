@@ -2,15 +2,19 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover 让页面铺到刘海屏边缘，配合下方的 safe-area 内边距 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <link
-      rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230F766E'/%3E%3Cellipse cx='16' cy='11' rx='7' ry='3' fill='%23fff'/%3E%3Crect x='9' y='11' width='14' height='10' fill='%23fff'/%3E%3Cellipse cx='16' cy='21' rx='7' ry='3' fill='%23fff'/%3E%3C/svg%3E"
-    />
+    <meta name="theme-color" content="#0D1314" />
+    <!-- 加到手机桌面时用同一套图标，避免出现空白方块 -->
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
     <title>牛库管家</title>
-    <script type="module" crossorigin src="./assets/index-DXh_veve.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-C9riDroU.css">
+    <script type="module" crossorigin src="./assets/index-DBFrd1rR.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/vue-_cKR6MNc.js">
+    <link rel="modulepreload" crossorigin href="./assets/element-plus-LHaSpxjP.js">
+    <link rel="stylesheet" crossorigin href="./assets/element-plus-DAujNXEt.css">
+    <link rel="stylesheet" crossorigin href="./assets/index-DyLNetic.css">
   </head>
   <body>
     <div id="app"></div>

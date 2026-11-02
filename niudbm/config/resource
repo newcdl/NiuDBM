@@ -6,6 +6,9 @@
       },
       {
         "name": "niudbm/exports"
+      },
+      {
+        "name": "niudbm/data"
       }
     ]
   }

@@ -1,5 +1,8 @@
 #!/bin/bash
-# 卸载完成：仅清理可再生的临时文件，用户数据一律保留
+# 卸载完成：清掉可再生的东西，用户数据一律保留
+#
+# 为什么删引擎而不删数据：引擎解出来 1.6GB 上下，重装应用后一键就能重新下载或导入；
+# 而实例目录、备份、凭据删了就找不回来。想连数据一起清空，见文件末尾的说明。
 set -u
 
 LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_uninstall.log}"
@@ -10,10 +13,11 @@ say() { echo "[$(date '+%F %T')] [uninstall_callback] $*"; }
 VAR="${TRIM_PKGVAR:-/var/apps/niudbm/var}"
 TMP="${TRIM_PKGTMP:-/var/apps/niudbm/tmp}"
 
-# 缓存可重建，直接清；实例数据、备份、凭据全部保留
+# 缓存可重建，直接清；实例数据、备份、凭据、容器全部保留
 rm -rf "$VAR/cache" 2>/dev/null && say "cache removed"
 rm -rf "$TMP"/* 2>/dev/null
 
-say "kept: $VAR (instances/engines/backups/niudbm.db)"
+say "kept: $VAR (instances/backups/niudbm.db)"
+say "如需彻底删除所有数据（不可恢复）：rm -rf $VAR"
 say "ok"
 exit 0

@@ -5,7 +5,9 @@
 package diag
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"niudbm/server/internal/dockerctl"
 	"niudbm/server/internal/platform"
 )
 
@@ -223,7 +226,6 @@ func boundaryGroup(env platform.Env) Group {
 	}{
 		{"deny-etc", "写入 /etc", "/etc", "P-03"},
 		{"deny-apps", "写入其他应用目录", "/var/apps", "P-03"},
-		{"deny-docker", "访问 Docker Socket", "/var/run/docker.sock", "P-03"},
 	}
 
 	for _, c := range checks {
@@ -233,6 +235,14 @@ func boundaryGroup(env platform.Env) Group {
 			level = Fail
 		}
 		items = append(items, Item{ID: c.id, Level: level, Name: c.name, Detail: detail, Ref: c.ref})
+	}
+
+	// Docker 现在是我们自己要用的能力（Docker 方式的数据库全靠它），
+	// 不再是"必须被拒绝"的越权项：能连上就是可用，连不上只影响这一种运行方式。
+	if ok, detail := probeDockerSocket(); ok {
+		items = append(items, Item{ID: "docker-sock", Level: Pass, Name: "Docker Socket", Detail: detail, Ref: "P-03"})
+	} else {
+		items = append(items, Item{ID: "docker-sock", Level: Warn, Name: "Docker Socket", Detail: detail, Ref: "P-03"})
 	}
 
 	if len(env.AccessiblePaths) > 0 {
@@ -404,6 +414,29 @@ func probeWritable(path string) (bool, string) {
 }
 
 // probeDenied 检查越权访问是否被拒绝。denied=true 表示边界有效。
+// probeDockerSocket 判断当前用户能不能连通 docker 守护进程。
+//
+// 必须真的 dial 一次：socket 文件的权限位只能看出"有没有位"，看不出当前用户
+// 是否在属组里——而"应用用户不在 docker 组"正是这台机器上最常见的情况。
+func probeDockerSocket() (bool, string) {
+	sock := dockerctl.DefaultSocket
+	conn, err := net.DialTimeout("unix", sock, 1500*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return true, "可访问 " + sock + "，Docker 方式的数据库可用"
+	}
+	if _, statErr := os.Stat(sock); statErr != nil {
+		return false, "没有 " + sock + "：系统未安装或未启动 Docker，Docker 方式不可用"
+	}
+	// 必须用 errors.Is：net.Dial 返回的是 *net.OpError，
+	// os.IsPermission 只认 PathError/LinkError/SyscallError，对 OpError 一律 false，
+	// 会把"没权限"误报成"Docker 没运行"——真机上就是这么被带偏的。
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EACCES) {
+		return false, dockerctl.PermissionHint()
+	}
+	return false, fmt.Sprintf("连不上 %s：%v（Docker 服务可能没在运行，或 socket 不是这个路径）", sock, err)
+}
+
 func probeDenied(path string) (bool, string) {
 	fi, err := os.Stat(path)
 	if err != nil {

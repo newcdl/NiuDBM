@@ -126,6 +126,59 @@ func TestMissingInstance(t *testing.T) {
 	}
 }
 
+// 配额与存储方式要能往返：漏掉列会导致改完配额、刷新页面又变回"不限制"。
+func TestInstanceQuotaRoundTrip(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	in := sampleInstance("Q1", "带配额的库")
+	in.Engine = "mysql"
+	in.Runtime = "docker"
+	in.Port = 33061
+	in.CPULimit = 2
+	in.MemLimitMB = 1024
+	in.StorageKind = "bind"
+	in.StoragePath = "/vol1/mysql/q1"
+	if err := s.CreateInstance(ctx, in); err != nil {
+		t.Fatalf("创建失败：%v", err)
+	}
+
+	got, err := s.GetInstance(ctx, "Q1")
+	if err != nil {
+		t.Fatalf("读取失败：%v", err)
+	}
+	if got.CPULimit != 2 || got.MemLimitMB != 1024 {
+		t.Fatalf("配额没存住：cpu=%v mem=%d", got.CPULimit, got.MemLimitMB)
+	}
+	if got.StorageKind != "bind" || got.StoragePath != "/vol1/mysql/q1" {
+		t.Fatalf("存储方式没存住：kind=%q path=%q", got.StorageKind, got.StoragePath)
+	}
+
+	if err := s.UpdateLimits(ctx, "Q1", 0.5, 512); err != nil {
+		t.Fatalf("改配额失败：%v", err)
+	}
+	got, err = s.GetInstance(ctx, "Q1")
+	if err != nil {
+		t.Fatalf("二次读取失败：%v", err)
+	}
+	if got.CPULimit != 0.5 || got.MemLimitMB != 512 {
+		t.Fatalf("配额没更新：cpu=%v mem=%d", got.CPULimit, got.MemLimitMB)
+	}
+
+	// 老数据（空 StorageKind）读出来要收敛成 volume，界面才不会显示成空白
+	old := sampleInstance("Q2", "老库")
+	if err := s.CreateInstance(ctx, old); err != nil {
+		t.Fatalf("创建老实例失败：%v", err)
+	}
+	got, err = s.GetInstance(ctx, "Q2")
+	if err != nil {
+		t.Fatalf("读取老实例失败：%v", err)
+	}
+	if got.StorageKind != "volume" || got.CPULimit != 0 || got.MemLimitMB != 0 {
+		t.Fatalf("默认值不对：kind=%q cpu=%v mem=%d", got.StorageKind, got.CPULimit, got.MemLimitMB)
+	}
+}
+
 func TestBackupRecords(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -134,7 +187,7 @@ func TestBackupRecords(t *testing.T) {
 	}
 
 	rec := Backup{ID: "B1", InstanceID: "I1", Type: "manual", Status: "running",
-		StoragePath: "/backups/I1/snap-1.db", StartedAt: time.Now().UnixMilli()}
+		StoragePath: "/backups/I1/snap-1.db", Database: "shop", StartedAt: time.Now().UnixMilli()}
 	if err := s.CreateBackup(ctx, rec); err != nil {
 		t.Fatalf("写入备份记录失败：%v", err)
 	}
@@ -153,6 +206,10 @@ func TestBackupRecords(t *testing.T) {
 	}
 	if list[0].FileName != "snap-1.db" || list[0].Status != "succeeded" || list[0].SizeBytes != 4096 {
 		t.Fatalf("字段不符：%+v", list[0])
+	}
+	// 备份按库进行：库名必须能读回来，恢复时要靠它回到同一个库
+	if list[0].Database != "shop" {
+		t.Fatalf("备份的库名没存住：%+v", list[0])
 	}
 
 	// 跨实例取记录必须查不到

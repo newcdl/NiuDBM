@@ -24,12 +24,27 @@ if [ -r /proc/meminfo ]; then
   say "mem=${MEM_MB}MB"
 fi
 
+# 量可用空间。安装阶段 TRIM_APPDEST 指向的目录往往还没被创建出来，
+# 直接 df 一个不存在的路径只会拿到空字符串——拿空值当 0MB 用，会把好机器拦在门外。
+disk_free_mb() {
+  local p="${1:-/}"
+  while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -e "$p" ]; do
+    p="$(dirname "$p")"
+  done
+  [ -e "$p" ] || p="/"
+  df -Pk "$p" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}'
+}
+
 TARGET="${TRIM_APPDEST:-/}"
-AVAIL_MB="$(df -Pk "$TARGET" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}')"
-if [ "${AVAIL_MB:-0}" -lt 200 ]; then
+AVAIL_MB="$(disk_free_mb "$TARGET")"
+if [ -z "$AVAIL_MB" ]; then
+  # 量不出来就不拦安装：宁可装完在页面里提示，也不能让正常机器装不上
+  say "WARN: 无法检测 $TARGET 所在分区的可用空间，跳过空间检查"
+elif [ "$AVAIL_MB" -lt 200 ]; then
   die "目标分区可用空间不足 200MB（当前 ${AVAIL_MB}MB）"
+else
+  say "free=${AVAIL_MB}MB"
 fi
-say "free=${AVAIL_MB}MB"
 
 say "ok"
 exit 0

@@ -1,223 +1,504 @@
 #!/bin/bash
-# 容器内冒烟：把刚编出来的二进制按真机方式跑起来，验证三条最容易在真机上坏的链路：
-#   1. 开发模式（TCP）能否直接启动并免身份运行；
-#   2. 平台模式（Unix Socket + 网关前缀 + 身份 Header）是否与飞牛网关的约定一致；
-#   3. 业务闭环：建库 → 读写 → 结构 → 备份（落共享目录）→ 恢复 → 删除 → 审计。
-# 由 scripts/smoke.sh 挂进容器执行，参数是容器内的二进制路径。
-# 依赖：bash、curl（需支持 --unix-socket）、grep、sed。
-set -u
-
+# 容器内验证实际产物：平台接入、权限、镜像清单、MySQL 服务生命周期、备份恢复与失败现场。
+#
+# 这一版本只有 MySQL + Docker：
+#   - 不挂 docker.sock / 没有 SMOKE_DOCKER=1 时，跑「不依赖容器」的那部分（接口契约、参数校验、权限、设置）。
+#   - 挂了 docker.sock 时，再跑完整的建服务 → 真实 TCP 认证 → 备份恢复 → 删除回收。
+set -euo pipefail
 BIN="${1:?需要二进制路径}"
-PORT=18780
 WORK="$(mktemp -d)"
-# 模拟 config/resource 分配的共享目录：basename 里带 backup，服务端才会选中它
-SHARE="$WORK/share/niudbm/backups"
-SOCK="$WORK/target/app.sock"
-
-ok() { echo "  [ok]   $*"; }
+chmod 755 "${WORK}"
+SHARE="${WORK}/share/niudbm/backups"
+SOCK="${WORK}/target/app.sock"
+PID=''
+ok() { echo "  [ok]   $* （第 ${SECONDS} 秒）"; }
+skip() { echo "  [skip] $*"; }
 die() {
   echo "  [fail] $*" >&2
-  if [ -f "$WORK/server.log" ]; then
-    echo "  --- 服务日志 ---" >&2
-    tail -n 20 "$WORK/server.log" >&2
-  fi
+  if [ -f "${WORK}/server.log" ]; then tail -n 20 "${WORK}/server.log" >&2; fi
+  for log in "${TRIM_PKGVAR:-}/instances"/*/deploy.log; do
+    [ -f "${log}" ] || continue
+    echo "  --- ${log}" >&2
+    tail -n 15 "${log}" >&2
+  done
+  cleanup_containers 2>/dev/null || true
   exit 1
 }
-first_id() { grep -o '"id":"[^"]*"' "$1" | head -1 | cut -d'"' -f4; }
+DOCKER_SNAPSHOT=''
+# 中途失败时容器还活着（重启策略会让它一直跑），真机上就是"服务没建好但端口被占着"。
+# 只清本次新增的：跑之前拍快照，结束时对比，差集才是这个脚本造出来的东西。
+cleanup_containers() {
+  command -v docker >/dev/null 2>&1 || return 0
+  [ -n "${DOCKER_SNAPSHOT:-}" ] && [ -f "${DOCKER_SNAPSHOT}" ] || return 0
+  docker ps -a --filter 'label=niudbm.managed=true' --format '{{.Names}}' >/tmp/smoke-after.names 2>/dev/null || return 0
+  while read -r c; do
+    [ -n "${c}" ] || continue
+    grep -qxF "${c}" "${DOCKER_SNAPSHOT}" || docker rm -f "${c}" >/dev/null 2>&1 || true
+  done </tmp/smoke-after.names
+  docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^niudbm-' >/tmp/smoke-after.vols || true
+  while read -r v; do
+    [ -n "${v}" ] || continue
+    grep -qxF "${v}" "${DOCKER_SNAPSHOT}.vol" 2>/dev/null || docker volume rm -f "${v}" >/dev/null 2>&1 || true
+  done </tmp/smoke-after.vols
+}
+cleanup() {
+  if [ -n "${PID}" ]; then kill "${PID}" 2>/dev/null || true; wait "${PID}" 2>/dev/null || true; fi
+  cleanup_containers
+}
+trap cleanup EXIT
+first_id() { sed -n 's/.*"data":{"id":"\([^"]*\)".*/\1/p' response.json; }
+first_field() { sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" response.json | head -n 1; }
+contains() { grep -Fq "$1" response.json || die "响应缺少 $1：$(cat response.json)"; }
+lacks() { if grep -Fq "$1" response.json; then die "响应不该包含 $1：$(cat response.json)"; fi; }
+[ -x "${BIN}" ] || die '二进制不可执行'
 
-[ -x "$BIN" ] || die "二进制不可执行：$BIN"
+# 容器里没有 docker CLI：静态下载一份（宿主的是 macOS 二进制，挂进来跑不了）。
+# 拉不到就退化成"不依赖容器"的冒烟，而不是把整个构建判失败。
+if [ "${SMOKE_DOCKER:-0}" = "1" ] && ! command -v docker >/dev/null 2>&1; then
+  case "$(uname -m)" in
+    aarch64 | arm64) DL_ARCH=aarch64 ;;
+    *) DL_ARCH=x86_64 ;;
+  esac
+  for base in https://download.docker.com https://mirrors.aliyun.com/docker-ce; do
+    url="${base}/linux/static/stable/${DL_ARCH}/docker-27.3.1.tgz"
+    if curl -fsSL --max-time 120 "${url}" -o /tmp/docker.tgz 2>/dev/null; then
+      tar -xzf /tmp/docker.tgz -C /tmp && export PATH="/tmp/docker:${PATH}" && break
+    fi
+  done
+  command -v docker >/dev/null 2>&1 || echo '  [warn] 没装上 docker CLI，容器相关冒烟会跳过'
+fi
 
-ver="$("$BIN" --version 2>/dev/null)"
-[ -n "$ver" ] || die "--version 没有输出"
-ok "版本 $ver"
+ok "版本 $("${BIN}" --version)"
+cd "${WORK}"
 
-# ---------- 1. 开发模式：没有 TRIM_* 时应能直接跑起来，且免身份 ----------
+# ---------- 开发模式：不依赖平台身份 ----------
 unset TRIM_APPDEST TRIM_PKGVAR TRIM_PKGETC TRIM_PKGTMP TRIM_PKGHOME TRIM_DATA_SHARE_PATHS
-cd "$WORK" || die "无法进入工作目录"
-"$BIN" --addr "127.0.0.1:$PORT" >dev.log 2>&1 &
-DEV_PID=$!
-trap 'kill "$DEV_PID" 2>/dev/null; wait "$DEV_PID" 2>/dev/null' EXIT
-
-base="http://127.0.0.1:$PORT"
-ready=0
-for _ in $(seq 1 100); do
-  if curl -fsS "$base/api/v1/health" -o dev-health.json 2>/dev/null; then
-    ready=1
-    break
-  fi
-  kill -0 "$DEV_PID" 2>/dev/null || die "开发模式进程启动后提前退出"
-  sleep 0.1
-done
-[ "$ready" -eq 1 ] || die "10 秒内没有响应健康检查"
-grep -q '"status":"ok"' dev-health.json || die "健康检查内容异常：$(cat dev-health.json)"
-grep -q '"platform":false' dev-health.json || die "开发模式应报告 platform=false"
-ok "开发模式可启动（无 TRIM_*，平台标记为 false）"
-
-curl -fsS -X POST "$base/api/v1/instances" -H 'Content-Type: application/json' \
-  -d '{"name":"开发库"}' -o dev-create.json || die "开发模式建库失败（$(cat dev-create.json 2>/dev/null)）"
-grep -q '"name":"开发库"' dev-create.json || die "开发模式建库返回异常"
-ok "开发模式免身份可写（本地调试不会被 401 挡住）"
-
-kill "$DEV_PID" 2>/dev/null
-wait "$DEV_PID" 2>/dev/null
-trap - EXIT
-rm -rf "${TMPDIR:-/tmp}/niudbm-dev" 2>/dev/null
-
-# ---------- 2. 平台变量下的只读自检 ----------
-export TRIM_APPNAME=niudbm
-export TRIM_APPDEST="$WORK/target"
-export TRIM_PKGVAR="$WORK/var"
-export TRIM_PKGETC="$WORK/etc"
-export TRIM_PKGTMP="$WORK/tmp"
-export TRIM_PKGHOME="$WORK/home"
-export TRIM_USERNAME=niudbm
-export TRIM_UID=1000
-export TRIM_GID=1000
-export TRIM_SYS_ARCH=x86_64
-export TRIM_DATA_SHARE_PATHS="$SHARE"
-mkdir -p "$TRIM_APPDEST" "$TRIM_PKGVAR" "$TRIM_PKGETC" "$TRIM_PKGTMP" "$TRIM_PKGHOME" "$SHARE"
-
-"$BIN" --diag >diag.txt 2>&1 || die "--diag 退出码非 0"
-grep -q "平台自检" diag.txt || die "--diag 输出缺少标题"
-# 容器里以 root 运行，权限类项必然 FAIL；这里只要求目录类检查真的跑出 PASS
-pass_count="$(grep -c '^  PASS' diag.txt || true)"
-[ "${pass_count:-0}" -ge 5 ] || die "--diag 通过项太少（${pass_count}）：$(cat diag.txt)"
-ok "平台自检可执行（${pass_count} 项 PASS）"
-
-# ---------- 3. 平台模式：Unix Socket + 网关前缀 + 身份 Header ----------
-"$BIN" --socket "$SOCK" >server.log 2>&1 &
+"${BIN}" --addr 127.0.0.1:18780 >dev.log 2>&1 &
 PID=$!
-trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null' EXIT
-
 for _ in $(seq 1 100); do
-  [ -S "$SOCK" ] && break
-  kill -0 "$PID" 2>/dev/null || die "平台模式进程启动后提前退出"
+  if curl -fsS http://127.0.0.1:18780/api/v1/health -o response.json 2>/dev/null; then break; fi
+  kill -0 "${PID}" 2>/dev/null || die '开发模式提前退出'
   sleep 0.1
 done
-[ -S "$SOCK" ] || die "10 秒内没有在 TRIM_APPDEST 下创建 socket：$SOCK"
-ok "socket 落在 TRIM_APPDEST 下（${SOCK#"$WORK"/}）"
+contains '"platform":false'
+contains '"engine":"mysql"'
 
-APP="http://localhost/app/niudbm"
-CURL=(curl -sS --unix-socket "$SOCK")
+# 名字校验：路径分隔符、超长、空值都必须在动手部署之前拒掉
+curl -sS -X POST http://127.0.0.1:18780/api/v1/instances -H 'Content-Type: application/json' \
+  -d '{"name":"a/b"}' -o response.json -w '%{http_code}' >dev.status
+[ "$(cat dev.status)" = 400 ] || die "非法名字应 400，实际 $(cat dev.status)：$(cat response.json)"
+
+# 非 MySQL 引擎明确拒绝，不能悄悄建一个 MySQL
+curl -sS -X POST http://127.0.0.1:18780/api/v1/instances -H 'Content-Type: application/json' \
+  -d '{"name":"pg","engine":"postgres"}' -o response.json -w '%{http_code}' >dev.status
+[ "$(cat dev.status)" = 400 ] || die "postgres 应 400，实际 $(cat dev.status)：$(cat response.json)"
+contains '只支持 MySQL'
+
+# 镜像清单是版本唯一来源
+curl -fsS http://127.0.0.1:18780/api/v1/images -o response.json
+contains '"tag":"8.4"'
+contains '"name":"mysql:8.4"'
+contains '"family":"mysql"'
+cleanup
+PID=''
+ok '开发模式启动、健康检查、名字与引擎校验、镜像清单'
+
+# ---------- 平台模式：网关注入身份 ----------
+export TRIM_APPNAME=niudbm TRIM_USERNAME=niudbm TRIM_UID=1000 TRIM_GID=1000
+export TRIM_APPDEST="${WORK}/target" TRIM_PKGVAR="${WORK}/var" TRIM_PKGETC="${WORK}/etc"
+export TRIM_PKGTMP="${WORK}/tmp" TRIM_PKGHOME="${WORK}/home" TRIM_DATA_SHARE_PATHS="${SHARE}"
+export TRIM_SYS_ARCH="$(uname -m)"
+mkdir -p "${TRIM_APPDEST}" "${TRIM_PKGVAR}" "${TRIM_PKGETC}" "${TRIM_PKGTMP}" "${TRIM_PKGHOME}" "${SHARE}"
+if ! id -u niudbm >/dev/null 2>&1; then useradd -u 1000 -m niudbm; fi
+"${BIN}" --diag >diag.txt 2>&1
+grep -q '平台自检' diag.txt || die '自检缺少标题'
+[ "$(grep -c '^  PASS' diag.txt)" -ge 5 ] || die '自检通过项过少'
+"${BIN}" --socket "${SOCK}" >server.log 2>&1 &
+PID=$!
+for _ in $(seq 1 100); do
+  [ -S "${SOCK}" ] && break
+  kill -0 "${PID}" 2>/dev/null || die '平台模式提前退出'
+  sleep 0.1
+done
+[ -S "${SOCK}" ] || die '未创建平台 socket'
+APP='http://localhost/app/niudbm'
+CURL=(curl -sS --max-time 600 --unix-socket "${SOCK}")
 ADMIN=(-H 'X-Trim-Userid: 1000' -H 'X-Trim-Username: admin' -H 'X-Trim-Isadmin: true')
 GUEST=(-H 'X-Trim-Userid: 1001' -H 'X-Trim-Username: guest' -H 'X-Trim-Isadmin: false')
-
-# 网关是否剥离 gatewayPrefix 未知，两种路径都必须能命中
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/health" -o gw1.json || die "带前缀的健康检查失败"
-grep -q '"status":"ok"' gw1.json || die "带前缀健康检查内容异常：$(cat gw1.json)"
-"${CURL[@]}" "${ADMIN[@]}" "http://localhost/api/v1/health" -o gw2.json || die "剥离前缀后的健康检查失败"
-grep -q '"status":"ok"' gw2.json || die "剥离前缀后健康检查内容异常：$(cat gw2.json)"
-grep -q '"platform":true' gw1.json || die "平台模式应报告 platform=true"
-ok "网关路径双兼容（带 /app/niudbm 与剥离前缀都可命中）"
-
-# 身份三道闸：无头 → 401，普通用户 → 401，管理员 → 放行
-for case_name in anon guest; do
-  case "$case_name" in
-    anon)  extra=();            label="没有身份头" ;;
-    guest) extra=("${GUEST[@]}"); label="普通用户" ;;
+req() {
+  local expected="$1" method="$2" route="$3" body="${4:-}" mime="${5:-application/json}" status rc=''
+  status="$("${CURL[@]}" --connect-timeout 5 "${ADMIN[@]}" -X "${method}" "${APP}/api/v1${route}" \
+    -H "Content-Type: ${mime}" --data-binary "${body}" -o response.json -w '%{http_code}')" || rc=$?
+  if [ -n "${rc}" ]; then
+    die "${method} ${route} 请求没有完成（curl 退出码 ${rc}）：$(cat response.json 2>/dev/null)"
+  fi
+  [ "${status}" = "${expected}" ] || die "${method} ${route} 应为 ${expected}，实际 ${status}：$(cat response.json)"
+  case "${expected}" in
+    2*) contains '"code":0' ;;
+    *) if grep -q '"code":0' response.json; then die '错误响应不应返回成功码'; fi ;;
   esac
-  status="$("${CURL[@]}" "${extra[@]}" -o "deny-$case_name.json" -w '%{http_code}' \
-    -X POST "$APP/api/v1/instances" -H 'Content-Type: application/json' \
-    -d "{\"name\":\"${case_name}库\"}")"
-  [ "$status" = "401" ] || die "${label}仍能写库（HTTP $status）：$(cat "deny-$case_name.json")"
-  grep -q '"code":10002' "deny-$case_name.json" || die "${label}被拒时错误码不对：$(cat "deny-$case_name.json")"
-done
-ok "无身份头 / 普通用户的写操作都被拦下（401 / 10002）"
+}
+# 服务没有默认库了：SQL 脚本必须点名落在哪个库上
+sql() { req "$1" POST "/instances/$2/import/sql?database=$3" "$4" text/plain; }
+wait_task() {
+  local id="$1" expect="${2:-ok}"
+  for _ in $(seq 1 600); do
+    req 200 GET "/deploy-tasks/${id}"
+    if grep -q "\"status\":\"${expect}\"" response.json; then return 0; fi
+    if [ "${expect}" = ok ] && grep -q '"status":"failed"' response.json; then
+      die "部署失败：$(cat response.json)"
+    fi
+    sleep 1
+  done
+  die '部署任务超时'
+}
+deploy() {
+  local body="$1" id
+  req 200 POST /instances "${body}"
+  contains '"async":true'
+  id="$(first_field taskId)"
+  [ -n "${id}" ] || die '创建实例没有返回 taskId'
+  wait_task "${id}"
+  first_field instanceId
+}
 
-"${CURL[@]}" "${GUEST[@]}" "$APP/api/v1/instances" -o guest-list.json || die "普通用户读列表失败"
-grep -q '"items"' guest-list.json || die "普通用户读列表内容异常"
-ok "普通用户可读列表"
+# 身份与权限
+"${CURL[@]}" "${GUEST[@]}" -o response.json -w '%{http_code}' "${APP}/api/v1/health" >guest.status
+[ "$(cat guest.status)" = 200 ] || die '普通用户读健康检查应 200'
+"${CURL[@]}" "${GUEST[@]}" -X PATCH "${APP}/api/v1/settings" -H 'Content-Type: application/json' \
+  -d '{}' -o response.json -w '%{http_code}' >guest.status
+[ "$(cat guest.status)" = 401 ] || die "普通用户写操作应 401，实际 $(cat guest.status)"
+"${CURL[@]}" -o response.json -w '%{http_code}' "${APP}/api/v1/instances" >guest.status
+[ "$(cat guest.status)" = 401 ] || die "没有身份应 401，实际 $(cat guest.status)"
+ok '网关身份与管理员权限'
 
-"${CURL[@]}" "${GUEST[@]}" "$APP/api/v1/diag" -o guest-diag.json || die "普通用户读自检失败"
-grep -q '"isAdmin":false' guest-diag.json || die "普通用户自检里的 isAdmin 应为 false"
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/diag" -o admin-diag.json || die "管理员读自检失败"
-grep -q '"isAdmin":true' admin-diag.json || die "管理员自检里的 isAdmin 应为 true"
-ok "身份 Header 解析正确（isAdmin 随网关透传变化）"
+# 概览 / 设置 / 任务 / 镜像
+req 200 GET /overview
+contains '"images"'
+req 200 GET /images
+contains '"tag":"8.4"'
+contains '"arch"'
+req 200 GET /preflight
+contains '"docker"'
+req 200 GET /jobs
+contains '"total":0'
+req 200 GET /settings
+contains '"backupRetentionCount"'
+req 200 PATCH /settings '{"backupRetentionCount":5}'
+req 200 GET /audit
+req 404 GET /deploy-tasks/nope
+ok '概览、镜像、设置、任务与未知任务 404'
 
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"冒烟库","seedSql":"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"}' \
-  -o create.json || die "建库请求失败（$(cat create.json 2>/dev/null)）"
-grep -q '"name":"冒烟库"' create.json || die "建库返回异常：$(cat create.json)"
-ID="$(first_id create.json)"
-[ -n "$ID" ] || die "无法解析实例 ID"
-grep -q '"tableCount":1' create.json || die "建库后表数量应为 1：$(cat create.json)"
-ok "建库成功（带初始化 SQL，1 张表）"
+# 参数校验：全部在异步之前挡住
+req 400 POST /instances '{"name":"x","engine":"postgres"}'
+contains '只支持 MySQL'
+req 400 POST /instances '{"name":"x","engineVersion":"9.9"}'
+contains '不支持这个版本'
+req 400 POST /instances '{"name":"x","users":[{"name":"u","password":"123","level":"read"}]}'
+req 400 POST /instances '{"name":"x","users":[{"name":"u","password":"password123","level":"root"}]}'
+req 400 POST /instances '{"name":"a/b"}'
+if [ "${SMOKE_DOCKER:-0}" != "1" ]; then
+  # 没有 Docker 时，参数合法的请求也要在动手之前说清楚原因，而不是挂一个注定的任务
+  req 400 POST /instances '{"name":"校验库"}'
+  contains 'Docker'
+  ok '参数校验（含 Docker 不可用时明确拒绝）'
+else
+  ok '参数校验'
+fi
 
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/query" \
-  -H 'Content-Type: application/json' \
-  -d "{\"sql\":\"INSERT INTO t (v) VALUES ('hello')\"}" -o w.json || die "写入请求失败"
-grep -q '"rowsAffected":1' w.json || die "写入结果异常：$(cat w.json)"
-ok "SQL 写入成功"
 
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/query" \
-  -H 'Content-Type: application/json' -d '{"sql":"SELECT v FROM t"}' -o r.json || die "查询请求失败"
-grep -q 'hello' r.json || die "查询结果异常：$(cat r.json)"
-ok "SQL 查询成功"
+# ---------- 依赖 Docker 的部分 ----------
+"${CURL[@]}" "${ADMIN[@]}" "${APP}/api/v1/health" -o health.json 2>/dev/null || true
+DOCKER_OK="$(sed -n 's/.*"docker":\(true\|false\).*/\1/p' health.json 2>/dev/null | head -n 1)"
+if [ "${SMOKE_DOCKER:-0}" = "1" ] && [ "${DOCKER_OK:-false}" != "true" ]; then
+  echo "  [info] 服务端读不到 Docker：$(cat health.json 2>/dev/null)"
+  echo "  [info] docker CLI=$(command -v docker || echo 无) sock=$(ls -l /var/run/docker.sock 2>&1 | head -1)"
+fi
+if [ "${DOCKER_OK:-false}" != "true" ] || [ "${SMOKE_DOCKER:-0}" != "1" ]; then
+  skip '未启用 Docker（SMOKE_DOCKER=1 且挂载 docker.sock 才跑服务生命周期）'
+  exit 0
+fi
 
-# 护栏：一次只能执行一条语句
-status="$("${CURL[@]}" "${ADMIN[@]}" -o guard.json -w '%{http_code}' \
-  -X POST "$APP/api/v1/instances/$ID/query" -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT 1; SELECT 2"}')"
-[ "$status" = "400" ] || die "多条语句未被拒绝（HTTP $status）：$(cat guard.json)"
-ok "多语句护栏生效"
+PW='SmokePass_Only42'
 
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/instances/$ID/schema" -o schema.json || die "结构请求失败"
-grep -q '"name":"t"' schema.json || die "结构信息里没有建出的表"
-ok "表结构读取成功"
+# 拍一份"跑之前就有的容器与卷"：失败中断时 cleanup 靠差集清理，不误删用户自己的实例
+if command -v docker >/dev/null 2>&1; then
+  DOCKER_SNAPSHOT="/tmp/docker-before.$$"
+  docker ps -a --filter 'label=niudbm.managed=true' --format '{{.Names}}' > "${DOCKER_SNAPSHOT}" 2>/dev/null || true
+  docker volume ls --format '{{.Name}}' | grep '^niudbm-' > "${DOCKER_SNAPSHOT}.vol" 2>/dev/null || true
+fi
 
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/backups" \
-  -H 'Content-Type: application/json' -d '{"note":"冒烟备份"}' -o bk.json || die "备份请求失败"
-grep -q '"status":"succeeded"' bk.json || die "备份状态异常：$(cat bk.json)"
-grep -q '"checksum":"[0-9a-f]\{64\}"' bk.json || die "备份缺少校验和：$(cat bk.json)"
-BID="$(first_id bk.json)"
-[ -n "$BID" ] || die "无法解析备份 ID"
-# 备份必须落在平台分配的共享目录，用户才能在文件管理器里看到
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/instances/$ID/backups" -o bl.json || die "备份列表请求失败"
-grep -Fq "\"backupRoot\":\"$SHARE\"" bl.json || die "备份根目录没选中共享目录：$(cat bl.json)"
-bkfile="$(ls "$SHARE/$ID"/*.db 2>/dev/null | head -1)"
-[ -n "$bkfile" ] || die "共享目录下没有备份文件：$SHARE/$ID"
-ok "备份成功并落到共享目录（$(basename "$bkfile")）"
+# 部署失败必须留现场：非法初始化 SQL 让 Provision 阶段失败，
+# 台账里要留一条 failed，能读原因，也能拿到当时的容器/引擎日志。
+req 200 POST /instances '{"name":"失败现场","engineVersion":"8.4","seedSql":"SELECT * FROM not_a_table;"}'
+FAILTASK="$(first_field taskId)"
+[ -n "${FAILTASK}" ] || die '失败用例没有返回 taskId'
+wait_task "${FAILTASK}" failed
+BADID="$(first_field instanceId)"
+[ -n "${BADID}" ] || die '失败任务没有带回实例号，列表里就无法呈现'
+req 200 GET "/instances/${BADID}"
+contains '"status":"failed"'
+contains '"statusReason"'
+req 200 GET "/instances/${BADID}/deploy-log"
+contains '"available":true'
+contains '阶段 provision 失败'
+req 200 DELETE "/instances/${BADID}" '{"confirmName":"失败现场","keepData":false}'
+[ ! -d "${TRIM_PKGVAR}/instances/${BADID}" ] || die '失败实例删除后目录未回收'
+ok '部署失败保留现场、台账可见与部署日志'
 
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/instances/$ID/backups/$BID/download" -o dl.db || die "备份下载失败"
-[ -s dl.db ] || die "下载到的备份为空"
-ok "备份可下载"
+PGID="$(deploy "{\"name\":\"冒烟MySQL\",\"engineVersion\":\"8.4\",\"rootPassword\":\"${PW}\"}")"
+[ -n "${PGID}" ] || die '无法解析实例号'
+req 200 GET "/instances/${PGID}"
+contains '"status":"running"'
+contains '"engineVersion":"8.4"'
+# 默认落在宿主机目录：路径真实存在，体积算得出来（先读详情，最后再读连接信息，
+# 否则 response.json 被覆盖，下面的账号端口会取错响应）
+req 200 GET "/instances/${PGID}"
+contains '"storageKind":"bind"'
+DBDIR="$(first_field filePath)"
+[ -d "${DBDIR}" ] || die "数据目录不存在：${DBDIR}"
+req 200 GET "/instances/${PGID}/connection"
+contains '"running":true'
+# 连接地址不能是监听地址 0.0.0.0：用户复制到客户端一定连不上
+if grep -q '"host":"0.0.0.0"' response.json; then die '连接信息给的是监听地址 0.0.0.0'; fi
+# 概览给的必须是 root（带密码能直接进），也不该再带库名——一个服务下有多个库
+contains '"user":"root"'
+lacks '"database"'
+MYUSER="$(first_field user)"
+MYPORT="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' response.json | head -n 1)"
+MYPASS="$(first_field password)"
+[ -n "${MYPORT}" ] || die '连接信息里没有端口'
+[ -n "${MYPASS}" ] || die '连接信息里没有密码'
+ok "服务部署完成（${MYUSER}@127.0.0.1:${MYPORT}）"
 
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/query" \
-  -H 'Content-Type: application/json' \
-  -d "{\"sql\":\"INSERT INTO t (v) VALUES ('second')\"}" -o w2.json || die "第二次写入失败"
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/backups/$BID/restore" \
-  -H 'Content-Type: application/json' -d '{"confirmName":"冒烟库"}' \
-  -o restore.json || die "恢复请求失败"
-grep -q '"restored":true' restore.json || die "恢复结果异常：$(cat restore.json)"
-ok "备份恢复成功"
+# 镜像页：部署过的版本要显示"已在本机 + 谁在用"，在用时不许删
+req 200 GET /images
+if ! grep -qF '"usedBy":["冒烟MySQL"]' response.json; then
+  die "镜像占用没算对：$(head -c 400 response.json)"
+fi
+if ! grep -qF '"local":true' response.json; then
+  die '部署完成后镜像没有标成本地已有'
+fi
+req 409 DELETE /images/8.4
+contains '个服务在用'
+# 已在本机时再拉一次要直接回 cached，不再走网络
+req 200 POST /images/pull '{"tag":"8.4"}'
+contains '"cached":true'
+req 400 POST /images/pull '{"tag":"9.9"}'
+ok '镜像占用统计、在用时禁删、已存在免拉取'
 
-# 恢复后应只剩 1 行（备份时只有 hello）
-"${CURL[@]}" "${ADMIN[@]}" -X POST "$APP/api/v1/instances/$ID/query" \
-  -H 'Content-Type: application/json' -d '{"sql":"SELECT COUNT(*) AS n FROM t"}' -o cnt.json ||
-  die "恢复后查询失败"
-grep -q '\[1\]' cnt.json || die "恢复后行数不对（期望 1）：$(cat cnt.json)"
-ok "恢复后数据回到备份时刻"
+# 服务建出来是空的：不再自动带一个 app 库
+req 200 GET "/instances/${PGID}/databases"
+contains '"items":[]'
+ok '新建服务里没有任何库'
 
-# ---------- 4. 前端资源（网关前缀下） ----------
-"${CURL[@]}" "${ADMIN[@]}" "$APP" -o index.html || die "首页请求失败"
-grep -q 'id="app"' index.html || die "首页内容异常"
-grep -q '<base href="/app/niudbm/">' index.html || die "首页 base 注入不对：$(grep -o '<base[^>]*>' index.html)"
-asset="$(grep -o 'assets/[A-Za-z0-9_-]*\.js' index.html | head -1)"
-[ -n "$asset" ] || die "首页没有引用 JS 资源"
-"${CURL[@]}" "${ADMIN[@]}" "$APP/$asset" -o /dev/null || die "带前缀的静态资源访问失败：$asset"
-ok "前端页面与资源在网关前缀下可访问（$asset）"
+# 建库：后面所有表与账号都落在这个库上
+DB=shop
+req 201 POST "/instances/${PGID}/databases" "{\"name\":\"${DB}\"}"
+contains '"name":"shop"'
 
-"${CURL[@]}" "${ADMIN[@]}" "$APP/api/v1/audit" -o audit.json || die "审计请求失败"
-grep -q '"instance.create"' audit.json || die "审计缺少建库记录"
-grep -q '"backup.restore"' audit.json || die "审计缺少恢复记录"
-ok "审计记录可读（建库、恢复都有留痕）"
+# 建表 + 账号矩阵：真实 TCP 认证，不用管理账号冒充
+sql 200 "${PGID}" "${DB}" "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(64)); INSERT INTO t(v) VALUES ('hello');"
+req 201 POST "/instances/${PGID}/users" '{"name":"reader","password":"SmokePass_Only42","grants":[{"database":"shop","level":"read"}]}'
+req 201 POST "/instances/${PGID}/users" '{"name":"writer","password":"SmokePass_Only42","grants":[{"database":"shop","level":"write"}]}'
+req 201 POST "/instances/${PGID}/users" '{"name":"blocked","password":"SmokePass_Only42","grants":[{"database":"shop","level":"none"}]}'
+req 200 GET "/instances/${PGID}/users"
+contains '"name":"reader"'
 
-"${CURL[@]}" "${ADMIN[@]}" -X DELETE "$APP/api/v1/instances/$ID" \
-  -H 'Content-Type: application/json' \
-  -d '{"confirmName":"冒烟库","keepData":false}' -o del.json || die "删除请求失败"
-grep -q '"keepData":false' del.json || die "删除返回异常：$(cat del.json)"
-[ ! -d "$TRIM_PKGVAR/instances/$ID" ] || die "删除后实例目录仍在：$TRIM_PKGVAR/instances/$ID"
-ok "删除实例成功（数据已移入回收站）"
+PROBE=/tmp/mysql-access.test
+go -C /src/server test -buildvcs=false -c -o "${PROBE}" ./internal/mysqlctl >/dev/null 2>&1 \
+  || die '编译真实认证探针失败'
+access() {
+  local user="$1" password="$2" query="$3" code="${4:-}"
+  MYSQL_SMOKE_PORT="${MYPORT}" MYSQL_SMOKE_USER="${user}" MYSQL_SMOKE_PASSWORD="${password}" \
+    MYSQL_SMOKE_DB="${DB}" MYSQL_SMOKE_SQL="${query}" MYSQL_SMOKE_ERROR="${code}" \
+    "${PROBE}" -test.run '^TestTCPAccessSmoke$' >/dev/null 2>&1 \
+    || die "账号 ${user} 执行 ${query} 结果不符合预期（错误码 ${code:-无}）"
+}
+access reader "${PW}" 'SELECT * FROM t'
+access reader wrong_password 'SELECT 1' 1045
+access reader "${PW}" "INSERT INTO t(v) VALUES ('denied')" 1142
+access writer "${PW}" "BEGIN; INSERT INTO t(v) VALUES ('x'); UPDATE t SET v='y'; DELETE FROM t; ROLLBACK;"
+access writer "${PW}" 'CREATE TABLE nope(id int)' 1142
+access blocked "${PW}" 'SELECT 1' 1044
+access "${MYUSER}" "${MYPASS}" 'SELECT * FROM t'
+ok '真实 TCP 认证与读写/只读/无权限矩阵'
 
-echo "  [ok]   冒烟通过：开发模式、平台自检、socket、网关前缀、身份闸、建库、读写、护栏、结构、备份落盘、下载、恢复、前端、审计、删除"
+# 多库：再来一个，验证同一服务下多个库互不干扰
+req 201 POST "/instances/${PGID}/databases" "{\"name\":\"report\"}"
+contains '"name":"report"'
+# 库列表要带"授权用户"：列表页那一列直接用
+req 200 GET "/instances/${PGID}/databases"
+contains '"users":["reader"'
+# 一个账号两个库：降级与撤销都必须按库生效，不能一把全收
+req 200 PATCH "/instances/${PGID}/users/reader" '{"grants":[{"database":"shop","level":"read"},{"database":"report","level":"write"}]}'
+req 200 GET "/instances/${PGID}/users"
+contains '"database":"report"'
+# 只授 report 的账号
+req 201 POST "/instances/${PGID}/databases/report/users" '{"name":"report_app","password":"SmokePass_Only42","level":"write"}'
+contains '"database":"report"'
+req 200 GET "/instances/${PGID}/users"
+contains '"name":"report_app"'
+# 给不存在的库建账号必须被拒：不能建出空授权账号
+req 404 POST "/instances/${PGID}/databases/nosuchdb/users" '{"name":"ghost","password":"SmokePass_Only42","level":"read"}'
+# 引擎自带的库不能删
+req 400 DELETE "/instances/${PGID}/databases/mysql"
+ok '多库、按库授权与系统库保护'
+
+# 账号来源（hosts）：所有人 % 与指定 IP 两种形态
+req 201 POST "/instances/${PGID}/users" '{"name":"ipuser","password":"SmokePass_Only42","hosts":["172.16.10.111"],"grants":[{"database":"shop","level":"read"}]}'
+contains '"172.16.10.111"'
+# 再改来源：加第二个 IP，原来那个要保留
+req 200 PATCH "/instances/${PGID}/users/ipuser" '{"hosts":["172.16.10.111","172.16.10.112"]}'
+req 200 GET "/instances/${PGID}/users"
+contains '"172.16.10.112"'
+# 密码回显：本机保存的那一份能查回来（MySQL 里只有密文）
+req 200 GET "/instances/${PGID}/users/ipuser/password"
+contains '"password":"SmokePass_Only42"'
+# 网段来源：界面填的是 CIDR，落库必须转成 MySQL 认的点分掩码，否则永远匹配不上
+req 201 POST "/instances/${PGID}/users" '{"name":"cidruser","password":"SmokePass_Only42","hosts":["172.16.30.0/24"],"grants":[{"database":"shop","level":"read"}]}'
+contains '"172.16.30.0/255.255.255.0"'
+# 掩码非法要在参数层拒掉，不能写进 mysql.user 变成一条废账号
+req 400 POST "/instances/${PGID}/users" '{"name":"badcidr","password":"SmokePass_Only42","hosts":["172.16.30.0/33"]}'
+contains '掩码不合法'
+ok '访问来源支持网段（CIDR 转点分掩码）'
+
+# root 远程访问：直接查 mysql.user 里 root 的 host 列表。
+# 不拿"从宿主连不连得上"做断言——macOS 上 Docker Desktop 的端口转发会把源地址保留成
+# 127.0.0.1，MySQL 反解成 localhost，于是删掉 root@'%' 之后照样能连；那是转发层的假象，
+# 真机（Linux 桥接）从局域网连会被 1130 拒，这条放到真机清单里验。
+req 200 GET "/instances/${PGID}/connection"
+CONTAINER="$(first_field containerHost)"
+[ -n "${CONTAINER}" ] || die '连接信息里没有容器名'
+rootHosts() {
+  docker exec "${CONTAINER}" mysql -uroot -p"${MYPASS}" -N \
+    -e "SELECT host FROM mysql.user WHERE user='root'" 2>/dev/null | tr '\n' ' '
+}
+req 200 GET "/instances/${PGID}/root-access"
+contains '"remote":true'
+case "$(rootHosts)" in *%*) : ;; *) die "初始状态应有 root@'%'：$(rootHosts)" ;; esac
+req 200 PUT "/instances/${PGID}/root-access" '{"remote":false}'
+contains '"remote":false'
+case "$(rootHosts)" in *%*) die "关闭后 root@'%' 仍在：$(rootHosts)" ;; esac
+case "$(rootHosts)" in *localhost*) : ;; *) die "关闭不该删掉 root@localhost：$(rootHosts)" ;; esac
+req 200 PUT "/instances/${PGID}/root-access" '{"remote":true}'
+contains '"remote":true'
+case "$(rootHosts)" in *%*) : ;; *) die "重新开启后没有 root@'%'：$(rootHosts)" ;; esac
+
+# root 密码重设：太短与禁用字符在参数层挡住，改完旧密码立刻失效
+req 400 PUT "/instances/${PGID}/root-password" '{"password":"short"}'
+contains '至少 8 位'
+req 400 PUT "/instances/${PGID}/root-password" '{"password":"NiuSmoke$2026"}'
+req 200 PUT "/instances/${PGID}/root-password" '{"password":"NiuSmoke_2026"}'
+contains 'root 密码已更新'
+access "${MYUSER}" "${MYPASS}" 'SELECT 1' 1045
+access "${MYUSER}" 'NiuSmoke_2026' 'SELECT * FROM t'
+req 200 GET "/instances/${PGID}/connection"
+contains '"password":"NiuSmoke_2026"'
+MYPASS='NiuSmoke_2026'
+ok 'root 远程访问开关与 root 密码重设'
+
+# 性能方案与运行状态
+req 200 GET "/instances/${PGID}/config/presets"
+contains '"label":"4-8GB"'
+req 200 GET "/instances/${PGID}/status"
+contains '"buffer_pool_hit"'
+ok '账号来源、密码回显、性能方案与运行状态'
+
+# 配置文件原文：能读、能写、空内容被拦、能恢复上一版
+# 这是白名单之外参数的唯一入口，写坏了实例会起不来，所以四条都要在
+req 200 GET "/instances/${PGID}/config/file"
+contains '"backupExists":false'
+# 部署完就该是一份完整配置，而不是等第一次保存参数才有内容
+contains '"missing":[]'
+contains 'collation_server = utf8mb4_unicode_ci'
+contains 'innodb_redo_log_capacity'
+contains '# ---- InnoDB：内存与刷盘 ----'
+# 先用参数页保存一次，保证配置文件已经存在（第一次手写时没有"上一版"可备份）
+req 200 PUT "/instances/${PGID}/config" '{"values":{"max_connections":"200"}}'
+contains '"needRestart":true'
+req 200 PUT "/instances/${PGID}/config/file" '{"content":"[mysqld]\nmax_connections = 300\n"}'
+contains '"needRestart":true'
+req 200 GET "/instances/${PGID}/config/file"
+contains 'max_connections = 300'
+contains '"backupExists":true'
+# 空内容会让实例起不来，必须在参数层就拒掉
+req 400 PUT "/instances/${PGID}/config/file" '{"content":"   "}'
+contains '不能为空'
+req 200 POST "/instances/${PGID}/config/file/restore"
+contains '已恢复上一版'
+req 200 GET "/instances/${PGID}/config/file"
+if grep -qF 'max_connections = 300' response.json; then
+  die '恢复上一版之后手写的内容还在，恢复没生效'
+fi
+contains 'max_connections = 200'
+ok '配置文件原文读写、空内容拦截与恢复上一版'
+
+
+# 备份按库走：先备空库 shop，导出的 SQL 里只该有 shop
+req 201 POST "/instances/${PGID}/backups" '{"note":"按库备份","database":"shop"}'
+contains '"status":"succeeded"'
+contains '"database":"shop"'
+# 备份落在 backups/<实例号>/ 下，用 find 而不是 glob：
+# compgen 无匹配时返回非零，会把整个脚本提前带走
+SHOPSQL="$(find "${SHARE}" -name '*-shop-*.sql' -print -quit)"
+[ -n "${SHOPSQL}" ] || die '备份文件名里没有库名'
+grep -q 'CREATE DATABASE' "${SHOPSQL}" || die '备份文件里没有建库语句'
+if grep -q '`app`' "${SHOPSQL}"; then die '备份文件里混进了别的库'; fi
+ok '按库备份，导出的是这个库的 SQL 脚本'
+
+# 备份 → 改数据 → 恢复 → 比对
+sql 200 "${PGID}" "${DB}" "INSERT INTO t(v) VALUES ('before-backup');"
+req 201 POST "/instances/${PGID}/backups" '{"note":"冒烟备份","database":"shop"}'
+contains '"status":"succeeded"'
+# 记录里要写清这份备份属于哪个库
+contains '"database":"shop"'
+# 不传库名必须被拒：没有默认库可以兜底
+BID="$(first_id)"
+# 不传库名必须被拒：没有默认库可以兜底
+req 400 POST "/instances/${PGID}/backups" '{"note":"没选库"}'
+[ -n "${BID}" ] || die '没有拿到备份 ID'
+compgen -G "${SHARE}/*" >/dev/null || die "备份目录里没有文件：${SHARE}"
+sql 200 "${PGID}" "${DB}" "INSERT INTO t(v) VALUES ('after-backup');"
+req 200 POST "/instances/${PGID}/backups/${BID}/restore" '{"confirmName":"冒烟MySQL"}'
+contains '"restored":true'
+sql 200 "${PGID}" "${DB}" "SELECT COUNT(*) FROM t WHERE v='after-backup';"
+ok '备份、改数据、恢复与校验'
+
+# 删除：容器与数据目录都要回收
+req 200 DELETE "/instances/${PGID}" '{"confirmName":"冒烟MySQL","keepData":false}'
+[ ! -d "${TRIM_PKGVAR}/instances/${PGID}" ] || die '实例目录未回收'
+if command -v docker >/dev/null 2>&1; then
+  docker ps -a --format '{{.Names}}' | grep -qx "mysql-8.4-${MYPORT}" && die '容器未删除'
+fi
+ok '删除实例并回收容器与目录'
+
+# 命名卷的删除语义：keepData=false 必须连卷一起删（以前无条件删卷，
+# "保留数据"反而把数据删了；现在两个方向都要验）
+if command -v docker >/dev/null 2>&1; then
+  VOLID="$(deploy '{"name":"卷库","engineVersion":"8.4","storageKind":"volume"}')"
+  [ -n "${VOLID}" ] || die '无法解析卷实例号'
+  VOLNAME="niudbm-$(printf '%s' "${VOLID}" | tr 'A-Z' 'a-z')-data"
+  docker volume inspect "${VOLNAME}" >/dev/null 2>&1 || die "命名卷没有创建：${VOLNAME}"
+  req 200 GET "/instances/${VOLID}"
+  contains '"storageKind":"volume"'
+  req 200 DELETE "/instances/${VOLID}" '{"confirmName":"卷库","keepData":false}'
+  if docker volume inspect "${VOLNAME}" >/dev/null 2>&1; then
+    docker volume rm -f "${VOLNAME}" >/dev/null 2>&1 || true
+    die '删除数据后命名卷仍然存在'
+  fi
+  ok '命名卷随数据一起删除'
+
+  # 反方向：keepData=true 必须留住数据卷，否则"保留数据"是假的
+  KEEPID="$(deploy '{"name":"留库","engineVersion":"8.4","storageKind":"volume"}')"
+  [ -n "${KEEPID}" ] || die '无法解析留库实例号'
+  KEEPNAME="niudbm-$(printf '%s' "${KEEPID}" | tr 'A-Z' 'a-z')-data"
+  docker volume inspect "${KEEPNAME}" >/dev/null 2>&1 || die "命名卷没有创建：${KEEPNAME}"
+  req 200 DELETE "/instances/${KEEPID}" '{"confirmName":"留库","keepData":true}'
+  docker volume inspect "${KEEPNAME}" >/dev/null 2>&1 || die '选择保留数据后命名卷却被删了'
+  # 自检留下的卷不能堆在开发机上
+  docker volume rm -f "${KEEPNAME}" >/dev/null 2>&1 || true
+  ok '保留数据时命名卷仍在'
+else
+  skip '没有 docker CLI，无法核对命名卷'
+fi

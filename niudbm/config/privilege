@@ -3,5 +3,6 @@
     "run-as": "package"
   },
   "username": "niudbm",
-  "groupname": "niudbm"
+  "groupname": "niudbm",
+  "join-groups": ["docker"]
 }

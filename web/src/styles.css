@@ -1,38 +1,55 @@
+/*
+ * 全局样式分三层：
+ * 1) Element Plus 变量覆盖：品牌色、圆角、组件尺寸
+ * 2) 自定义变量映射：旧页面的 --bg/--fg 等一律指向 --el-*，切主题时自动跟着变
+ * 3) 少量通用类：新页面尽量直接用 el-* 组件，剩下的历史页面继续用这些类
+ */
 :root {
-  --bg: #f7f8fa;
-  --bg-elevated: #ffffff;
-  --fg: #1f2329;
-  --fg-muted: #6b7280;
-  --line: #e5e6eb;
-  --accent: #0f766e;
-  --accent-soft: #e6f4f1;
-  --ok: #0f9d58;
-  --warn: #d97706;
-  --bad: #d93026;
-  --ok-bg: #eaf7ef;
-  --warn-bg: #fdf4e6;
-  --bad-bg: #fdeceb;
+  color-scheme: light;
+
+  /* 品牌色：青绿。Element Plus 的地方色阶手动算好，避免依赖 color-mix */
+  --el-color-primary: #0f766e;
+  --el-color-primary-light-3: #579f9a;
+  --el-color-primary-light-5: #87bab7;
+  --el-color-primary-light-7: #b7d6d4;
+  --el-color-primary-light-8: #cfe4e2;
+  --el-color-primary-light-9: #e7f1f0;
+  --el-color-primary-dark-2: #0c5e58;
+
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-border-radius-round: 20px;
+  --el-font-size-base: 14px;
+
+  --bg: var(--el-bg-color-page);
+  --bg-elevated: var(--el-bg-color);
+  --fg: var(--el-text-color-primary);
+  --fg-muted: var(--el-text-color-secondary);
+  --line: var(--el-border-color-light);
+  --accent: var(--el-color-primary);
+  --accent-soft: var(--el-color-primary-light-9);
+  --ok: var(--el-color-success);
+  --warn: var(--el-color-warning);
+  --bad: var(--el-color-danger);
+  --ok-bg: var(--el-color-success-light-9);
+  --warn-bg: var(--el-color-warning-light-9);
+  --bad-bg: var(--el-color-danger-light-9);
   --radius: 10px;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 12px rgba(16, 24, 40, 0.04);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #15171a;
-    --bg-elevated: #1d2024;
-    --fg: #e6e8ea;
-    --fg-muted: #9aa0a6;
-    --line: #2c3036;
-    --accent: #4fd1c5;
-    --accent-soft: #10302d;
-    --ok: #4ade80;
-    --warn: #fbbf24;
-    --bad: #f87171;
-    --ok-bg: #14261c;
-    --warn-bg: #2a2214;
-    --bad-bg: #2b1a19;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-  }
+html.dark {
+  color-scheme: dark;
+
+  --el-color-primary: #4fd1c5;
+  --el-color-primary-light-3: #3d9890;
+  --el-color-primary-light-5: #32736c;
+  --el-color-primary-light-7: #264d49;
+  --el-color-primary-light-8: #203a37;
+  --el-color-primary-light-9: #1a2726;
+  --el-color-primary-dark-2: #72dad1;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 * {
@@ -49,9 +66,20 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font: 14px/1.6 -apple-system, BlinkMacSystemFont, system-ui, 'PingFang SC', 'Noto Sans CJK SC',
+  font: 14px/1.62 -apple-system, BlinkMacSystemFont, system-ui, 'PingFang SC', 'Noto Sans CJK SC',
     'Microsoft YaHei', sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* 每页根容器统一宽度：大屏不再无限拉宽，表格不会拉到一条线，
+   两侧留白把视线收回中间；超宽屏才放宽一档 */
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 1560px;
+  margin: 0 auto;
 }
 
 button {
@@ -63,18 +91,17 @@ button {
 code,
 .mono {
   font-family: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
+  font-size: 12.5px;
 }
 
-/* ---------- 通用控件 ---------- */
+/* ---------- 历史页面仍在用的通用类 ---------- */
 
-/* 各页重复度极高的按钮/表格/表单统一定义在这里，页面里只写差异部分 */
 .btn {
-  padding: 6px 12px;
+  padding: 7px 13px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg-elevated);
-  font-size: 12px;
+  font-size: 12.5px;
   white-space: nowrap;
 }
 
@@ -119,13 +146,13 @@ code,
 .textarea,
 .select {
   width: 100%;
-  padding: 7px 10px;
+  padding: 8px 11px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg);
   color: var(--fg);
   font: inherit;
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 .input:focus,
@@ -158,7 +185,7 @@ code,
 }
 
 .card {
-  padding: 16px 18px;
+  padding: 18px 22px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--bg-elevated);
@@ -167,7 +194,7 @@ code,
 
 .card h2 {
   margin: 0 0 12px;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--fg-muted);
 }
@@ -182,12 +209,12 @@ code,
 table.data {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 table.data th,
 table.data td {
-  padding: 9px 12px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--line);
   text-align: left;
   vertical-align: top;
@@ -198,7 +225,7 @@ table.data th {
   top: 0;
   background: var(--bg-elevated);
   color: var(--fg-muted);
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 500;
   white-space: nowrap;
 }
@@ -222,11 +249,11 @@ table.data th.num {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 11px 14px;
+  padding: 12px 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--bg-elevated);
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 .notice-ok {
@@ -279,6 +306,65 @@ table.data th.num {
   color: var(--accent);
 }
 
+/* ---------- 列表的卡片形态 ---------- */
+
+/* 表格之外的第二形态：所有列表共用同一套外框，内容由各页面自己写 */
+.list-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.list-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+}
+
+.list-card:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.list-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.list-card-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.list-card-ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.list-card-ops .el-button + .el-button {
+  margin-left: 0;
+}
+
 .empty {
   display: flex;
   flex-direction: column;
@@ -311,4 +397,176 @@ table.data th.num {
 .grow {
   flex: 1;
   min-width: 0;
+}
+
+/* ---------- Element Plus 细节 ---------- */
+
+/* 组件默认带阴影/描边，实际内容区统一成平面一点，贴合 NAS 管理后台观感 */
+.el-card {
+  --el-card-border-radius: var(--radius);
+}
+
+.el-dialog {
+  --el-dialog-border-radius: 12px;
+  --el-dialog-padding-primary: 18px;
+}
+
+.el-dialog__header {
+  margin-right: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.el-dialog__footer {
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.el-table {
+  --el-table-header-bg-color: var(--bg-elevated);
+  --el-table-tr-bg-color: var(--bg-elevated);
+  --el-table-row-hover-bg-color: var(--bg);
+}
+
+.el-table th.el-table__cell {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.el-tabs__item {
+  font-size: 13px;
+}
+
+/* 大屏：字号与密度上调一档。2K 屏上按 14px 排会显得又小又空，
+   内容宽度由各页 .page 的 max-width 兜住，这里只放大可读性 */
+@media (min-width: 1440px) {
+  body {
+    font-size: 15px;
+  }
+
+  :root {
+    --el-font-size-base: 15px;
+  }
+
+  .mono {
+    font-size: 13px;
+  }
+
+  .card {
+    padding: 20px 24px;
+  }
+
+  table.data {
+    font-size: 14px;
+  }
+
+  table.data th,
+  table.data td {
+    padding: 11px 16px;
+  }
+
+  .list-cards {
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  }
+}
+
+/* 手机端：触控目标不小于 38px；输入框 16px 字号，iOS 聚焦时才不会放大页面 */
+@media (max-width: 720px) {
+  body {
+    font-size: 15px;
+  }
+
+  :root {
+    --el-component-size: 38px;
+    --el-component-size-small: 32px;
+    --el-component-size-large: 42px;
+  }
+
+  .btn {
+    min-height: 38px;
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+
+  .btn-sm {
+    min-height: 32px;
+    padding: 5px 10px;
+    font-size: 13px;
+  }
+
+  .input,
+  .textarea,
+  .select {
+    min-height: 40px;
+    padding: 9px 11px;
+    font-size: 16px;
+  }
+
+  .textarea.mono,
+  .mono {
+    font-size: 13px;
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  .table-wrap {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table.data th,
+  table.data td {
+    padding: 10px 12px;
+  }
+
+  .notice {
+    align-items: flex-start;
+  }
+
+  .list-cards {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .list-card {
+    padding: 12px;
+  }
+
+  /* 弹窗头部的操作区：说明文字占一整行，按钮自己排一行靠右 */
+  .head-actions {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+
+  /* 手机上的卡片操作铺满整行并等分，比小按钮好按 */
+  .list-card-ops .el-button {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .el-dialog {
+    --el-dialog-width: 92%;
+    --el-dialog-margin-top: 6vh;
+  }
+
+  /* 弹窗在手机上铺满可用宽度，底部按钮各自占一半更好按 */
+  .el-dialog__footer {
+    display: flex;
+    gap: 8px;
+  }
+
+  .el-dialog__footer .el-button {
+    flex: 1;
+    margin-left: 0;
+  }
+
+  .el-input__inner,
+  .el-textarea__inner {
+    font-size: 16px;
+  }
+
+  .el-message-box {
+    --el-messagebox-width: 88%;
+  }
 }

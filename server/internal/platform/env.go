@@ -33,6 +33,9 @@ type Env struct {
 	DataSharePaths []string
 	// AccessiblePaths 来自 TRIM_DATA_ACCESSIBLE_PATHS，即用户授权的目录
 	AccessiblePaths []string
+	// DockerMirror 是拉镜像时用的加速前缀（例如 docker.m.daocloud.io/），
+	// 来自 NIUDBM_DOCKER_MIRROR：国内直连 Docker Hub 经常超时。
+	DockerMirror string
 }
 
 const defaultAppName = "niudbm"
@@ -67,6 +70,7 @@ func Load(version string) Env {
 		HasAPIToken:     os.Getenv("TRIM_API_TOKEN") != "",
 		DataSharePaths:  splitPaths(os.Getenv("TRIM_DATA_SHARE_PATHS")),
 		AccessiblePaths: splitPaths(os.Getenv("TRIM_DATA_ACCESSIBLE_PATHS")),
+		DockerMirror:    dockerMirror(os.Getenv("NIUDBM_DOCKER_MIRROR")),
 	}
 	return env
 }
@@ -115,4 +119,13 @@ func splitPaths(raw string) []string {
 		}
 	}
 	return out
+}
+
+// dockerMirror 把 "docker.m.daocloud.io" 规范成 "docker.m.daocloud.io/"；空值保持空。
+func dockerMirror(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	return strings.TrimSuffix(v, "/") + "/"
 }
