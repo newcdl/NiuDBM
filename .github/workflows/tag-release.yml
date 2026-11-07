@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的版本标签，例如 v1.0.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -21,11 +27,14 @@ jobs:
     name: Build and release
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Set up Go
@@ -53,9 +62,9 @@ jobs:
       - name: Verify tag and application version
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           app_version="$(grep '^version=' niudbm/manifest | cut -d= -f2)"
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "标签必须使用 vMAJOR.MINOR.PATCH 格式，例如 v1.0.0" >&2
             exit 1
           fi
@@ -101,7 +110,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: niudbm-${{ github.ref_name }}
+          name: niudbm-${{ inputs.tag || github.ref_name }}
           path: |
             dist/*.fpk
             dist/*-SHA256SUMS.txt
@@ -112,8 +121,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             dist/*.fpk \
             dist/*-SHA256SUMS.txt \
-            --title "牛库管家 $GITHUB_REF_NAME" \
+            --title "牛库管家 $RELEASE_TAG" \
             --generate-notes
