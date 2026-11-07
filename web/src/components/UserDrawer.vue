@@ -17,7 +17,12 @@ import {
   type HostRule,
 } from '../hostrule'
 
-const props = defineProps<{ instanceId: string; modelValue: boolean }>()
+const props = defineProps<{ instanceId: string; modelValue: boolean; engine?: string; canManage?: boolean }>()
+// PostgreSQL 没有 user@host：「来源」是 pg_hba.conf 的概念，
+// 这里如果照样画一套单选与 IP 列表，用户填了也不会生效
+const isPostgres = computed(() => props.engine === 'postgres')
+const isMongo = computed(() => props.engine === 'mongodb')
+const noHosts = computed(() => isPostgres.value || isMongo.value)
 const emit = defineEmits<{ 'update:modelValue': [value: boolean]; changed: [] }>()
 
 const LEVEL_TEXT: Record<string, string> = {
@@ -57,7 +62,7 @@ const busy = ref(false)
 const copied = ref('')
 const pick = ref<{ database: string; level: string }>({ database: '', level: 'read' })
 
-// 密码回显：MySQL 里只有密文，回显的是建号时留在本机的那一份
+// 密码回显：库里只有密文，回显的是建号/重设时留在本机的那一份
 const revealed = ref<Record<string, string>>({})
 const revealing = ref('')
 
@@ -92,6 +97,8 @@ function hostsOf(user: DbUser): string[] {
 }
 
 function hostLabel(user: DbUser): string {
+  // PG 的账号就是账号，没有 @来源
+  if (noHosts.value) return user.name
   const hosts = hostsOf(user)
   if (hosts.length === 1) return `${user.name}@${displayHost(hosts[0])}`
   return `${user.name}@${hosts.length} 个来源`
@@ -279,14 +286,14 @@ async function submit(): Promise<void> {
       await api.createUser(props.instanceId, {
         name,
         password: form.value.password,
-        hosts,
+        hosts: noHosts.value ? undefined : hosts,
         grants: form.value.grants,
       })
       ElMessage.success(`账号 ${name} 已创建`)
     } else if (editing.value) {
       await api.updateUser(props.instanceId, editing.value.name, {
         password: form.value.password || undefined,
-        hosts,
+        hosts: noHosts.value ? undefined : hosts,
         grants: form.value.grants,
       })
       ElMessage.success(`账号 ${editing.value.name} 已更新`)
@@ -344,7 +351,7 @@ watch(
     <div class="drawer">
       <div class="tools">
         <el-input v-model="keyword" :prefix-icon="Search" placeholder="搜索账号名、IP 或库名" clearable />
-        <el-button type="primary" @click="openCreate">新建用户</el-button>
+        <el-button v-if="canManage" type="primary" @click="openCreate">新建用户</el-button>
       </div>
 
       <el-alert v-if="error" type="error" :closable="false" show-icon :title="error" />
@@ -369,7 +376,7 @@ watch(
               >
                 {{ revealed[row.name] ?? '••••••••' }}
               </span>
-              <div class="pwd-ops">
+              <div v-if="canManage" class="pwd-ops">
                 <el-button
                   link
                   :icon="revealed[row.name] ? Hide : View"
@@ -409,7 +416,7 @@ watch(
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="112" align="right">
+        <el-table-column v-if="canManage" label="操作" width="112" align="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" :disabled="locked(row)" @click="openEdit(row)">
               编辑
@@ -425,8 +432,8 @@ watch(
 
       <el-empty v-if="!loading && !filtered.length" :image-size="64" description="没有匹配的用户" />
       <p class="foot-hint">
-        密码存在 MySQL 里是密文；这里能查看/复制的是建号或重设时留在本机的那一份。
-        用外部工具改过密码的账号查不到，只能在这里重设。
+        密码在数据库里是密文（MySQL 存哈希、PostgreSQL 存 SCRAM 校验值）；
+        这里能查看/复制的是建号或重设时留在本机的那一份。用外部工具改过密码的账号查不到，只能在这里重设。
       </p>
     </div>
   </el-drawer>
@@ -442,7 +449,17 @@ watch(
   >
     <div class="form-body">
       <p class="hint form-tip">
-        账号名 + 访问来源合起来才是一条 MySQL 账号；加一个来源就是多一条账号，去掉就是删掉那条。
+        <template v-if="isPostgres">
+          一个账号就是一个账号，能连哪些库由下面的「授权」决定。PostgreSQL 的访问来源在
+          pg_hba.conf 里（服务详情 →「配置文件」），不按账号区分。
+        </template>
+        <template v-else-if="isMongo">
+          一个 MongoDB 用户可以在多个数据库上拥有 read、readWrite 或 dbOwner 角色。
+          MongoDB 没有 user@host 来源概念，访问控制由网络与认证配置决定。
+        </template>
+        <template v-else>
+          账号名 + 访问来源合起来才是一条 MySQL 账号；加一个来源就是多一条账号，去掉就是删掉那条。
+        </template>
       </p>
 
       <div class="form-grid">
@@ -464,7 +481,7 @@ watch(
         </label>
       </div>
 
-      <div class="field">
+      <div v-if="!noHosts" class="field">
         <span>谁能连（访问来源）</span>
         <el-radio-group v-model="form.hostMode" class="host-mode">
           <el-radio-button :value="HOST_ALL">所有人</el-radio-button>

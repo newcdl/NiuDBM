@@ -64,6 +64,7 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false
   }
+  watchActive()
 }
 
 async function cancel(job: Job): Promise<void> {

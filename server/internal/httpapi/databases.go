@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"niudbm/server/internal/mysqlctl"
+	"niudbm/server/internal/store"
 )
 
 // 一个"服务"（MySQL 容器）下的多个"数据库"（schema）。
@@ -26,11 +27,7 @@ func (s *Server) handleListDatabases(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if in.Engine != mysqlctl.Engine {
-		s.fail(w, r, errBadRequest("实例管理目前只支持 MySQL 家族"))
-		return
-	}
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -60,11 +57,7 @@ func (s *Server) handleListCharsets(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if in.Engine != mysqlctl.Engine {
-		s.fail(w, r, errBadRequest("实例管理目前只支持 MySQL 家族"))
-		return
-	}
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -91,10 +84,6 @@ func (s *Server) handleCreateDatabase(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if in.Engine != mysqlctl.Engine {
-		s.fail(w, r, errBadRequest("实例管理目前只支持 MySQL 家族"))
-		return
-	}
 
 	var req createDatabaseReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -102,17 +91,17 @@ func (s *Server) handleCreateDatabase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if err := mysqlctl.ValidDBName(name); err != nil {
+	if err := validDBName(in, name); err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
 	}
-	users, uerr := prepareNewUsers(req.Users)
+	users, uerr := prepareNewUsers(in, req.Users)
 	if uerr != nil {
 		s.fail(w, r, errBadRequest(uerr.Error()))
 		return
 	}
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -153,7 +142,7 @@ func (s *Server) handleCreateDatabase(w http.ResponseWriter, r *http.Request) {
 //
 // 空白行（名字与密码都没填）直接跳过，前端加了一行没填也不会报错；
 // 只要填了名字就必须完整合法。这里做第一道校验，建用户时引擎侧还会再校验一次。
-func prepareNewUsers(raw []createUserReq) ([]createUserReq, error) {
+func prepareNewUsers(in store.Instance, raw []createUserReq) ([]createUserReq, error) {
 	seen := make(map[string]bool, len(raw))
 	out := make([]createUserReq, 0, len(raw))
 	for _, u := range raw {
@@ -164,7 +153,7 @@ func prepareNewUsers(raw []createUserReq) ([]createUserReq, error) {
 		if name == "" {
 			return nil, errors.New("接入用户的用户名不能为空")
 		}
-		if err := mysqlctl.ValidRoleName(name); err != nil {
+		if err := validRoleNameFor(in, name); err != nil {
 			return nil, err
 		}
 		if seen[strings.ToLower(name)] {
@@ -202,13 +191,9 @@ func (s *Server) handleCreateDatabaseUser(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if in.Engine != mysqlctl.Engine {
-		s.fail(w, r, errBadRequest("实例管理目前只支持 MySQL 家族"))
-		return
-	}
 
 	dbName := strings.TrimSpace(r.PathValue("name"))
-	if err := mysqlctl.ValidDBName(dbName); err != nil {
+	if err := validDBName(in, dbName); err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
 	}
@@ -219,7 +204,7 @@ func (s *Server) handleCreateDatabaseUser(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if err := mysqlctl.ValidRoleName(name); err != nil {
+	if err := validRoleNameFor(in, name); err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
 	}
@@ -236,7 +221,7 @@ func (s *Server) handleCreateDatabaseUser(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -292,10 +277,6 @@ func (s *Server) handleDropDatabase(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if in.Engine != mysqlctl.Engine {
-		s.fail(w, r, errBadRequest("实例管理目前只支持 MySQL 家族"))
-		return
-	}
 	name := strings.TrimSpace(r.PathValue("name"))
 	// 删库是不可逆的：要求把库名再输一遍，和删实例保持同一套确认习惯
 	confirm := r.URL.Query().Get("confirmName")
@@ -304,7 +285,7 @@ func (s *Server) handleDropDatabase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return

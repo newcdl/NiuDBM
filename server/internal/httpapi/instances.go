@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,15 +14,12 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"niudbm/server/internal/images"
 	"niudbm/server/internal/mysqlctl"
 	"niudbm/server/internal/store"
 )
 
-const (
-	maxNameRunes = 32
-	// engineMySQL 是唯一支持的引擎：产品只做 MySQL 协议系。
-	engineMySQL = "mysql"
-)
+const maxNameRunes = 32
 
 type instanceView struct {
 	store.Instance
@@ -34,17 +32,39 @@ type instanceView struct {
 	// 备份概况：列表页要能看出"这个库有没有在备份"
 	BackupCount  int   `json:"backupCount"`
 	LastBackupAt int64 `json:"lastBackupAt,omitempty"`
+	// Capabilities 是界面生成操作按钮的唯一依据。
+	// 外部连接与托管服务的差异不再靠前端各自的 if 判断。
+	Capabilities instanceCapabilities `json:"capabilities"`
+	AccessRole   string               `json:"accessRole"`
+}
+
+type instanceCapabilities struct {
+	StartStop       bool `json:"startStop"`
+	Container       bool `json:"container"`
+	Config          bool `json:"config"`
+	ConfigFile      bool `json:"configFile"`
+	Backup          bool `json:"backup"`
+	Users           bool `json:"users"`
+	Databases       bool `json:"databases"`
+	Transfer        bool `json:"transfer"`
+	TestConnection  bool `json:"testConnection"`
+	RevealRoot      bool `json:"revealRoot"`
+	DeletePermanent bool `json:"deletePermanent"`
+	Members         bool `json:"members"`
 }
 
 type createInstanceReq struct {
 	Name string `json:"name"`
 	// Engine 只接受 mysql；保留字段是为了给老客户端一个明确错误，而不是静默建错库
 	Engine string `json:"engine"`
-	// EngineVersion 是镜像 tag（8.4 / 8.0 / 11.4），留空用默认 LTS
+	// EngineVersion 是镜像 tag（8.4 / 8.0 / 11.4 / 17），留空用默认版本
 	EngineVersion string `json:"engineVersion"`
-	Profile       string `json:"profile"`
-	SeedSQL       string `json:"seedSql"`
-	Note          string `json:"note"`
+	// Image 是可选的自定义镜像地址（含私有仓库或加速站前缀，必须带版本标签）。
+	// 国内网络拉不动 Docker Hub 时，用户可以在部署页直接改这一项。
+	Image   string `json:"image"`
+	Profile string `json:"profile"`
+	SeedSQL string `json:"seedSql"`
+	Note    string `json:"note"`
 	// Users 是建库时一并创建的接入账号：让“建库 + 发账号”一次做完，
 	// 不必先建库再用系统超级用户登录改权限。
 	Users []createUserReq `json:"users"`
@@ -64,6 +84,8 @@ type createInstanceReq struct {
 
 // createOpts 是建服务时与资源/存储相关的选项。
 type createOpts struct {
+	// Image 是用户指定的完整镜像地址；空表示用清单里的官方名
+	Image        string
 	RootPassword string
 	CPULimit     float64
 	MemLimitMB   int64
@@ -91,7 +113,6 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_ = id
 
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
@@ -101,10 +122,17 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errInternal("读取实例列表失败"))
 		return
 	}
+	list, _, err = s.visibleInstances(r.Context(), id, list)
+	if err != nil {
+		s.fail(w, r, errInternal("读取服务权限失败"))
+		return
+	}
 
 	items := make([]instanceView, 0, len(list))
 	for _, in := range list {
-		items = append(items, s.view(in))
+		v := s.view(in)
+		s.applyAccess(r, id, &v)
+		items = append(items, v)
 	}
 	// 列表上直接给出"几份备份、最近一次何时"：用户扫一眼就知道谁没在备份
 	s.attachBackupStats(r.Context(), items)
@@ -112,7 +140,7 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.requireInstanceAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -145,12 +173,19 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errBadRequest(oerr.Error()))
 		return
 	}
-	engineName := strings.TrimSpace(req.Engine)
-	if engineName != "" && engineName != engineMySQL {
-		s.fail(w, r, errBadRequest("这一版本只支持 MySQL，暂不提供 "+engineName))
+	if err := s.validateStoragePath(opts.StoragePath); err != nil {
+		s.fail(w, r, errBadRequest(err.Error()))
 		return
 	}
-	engineName = engineMySQL
+	engineName := strings.TrimSpace(req.Engine)
+	if engineName == "" {
+		// 老前端不带 engine，仍按 MySQL 处理
+		engineName = engineMySQL
+	}
+	if engineName != engineMySQL && engineName != enginePostgres && engineName != engineMongoDB {
+		s.fail(w, r, errBadRequest("不支持的引擎："+engineName+"；可选 MySQL / PostgreSQL / MongoDB"))
+		return
+	}
 
 	// 重名要在动手之前就拒掉：拉起容器几十秒后才报"名字已存在"，用户只会白等一场
 	taken, terr := s.st.NameTaken(r.Context(), name)
@@ -163,7 +198,7 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	detail := "名称 " + name + "，引擎 MySQL"
+	detail := "名称 " + name + "，引擎 " + engineLabel(engineName)
 	if req.EngineVersion != "" {
 		detail += " " + req.EngineVersion
 	}
@@ -173,6 +208,9 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	if opts.StorageKind == storageBind {
 		detail += "，数据目录 " + opts.StoragePath
+	}
+	if opts.Image != "" {
+		detail += "，镜像 " + opts.Image
 	}
 	if req.Note != "" {
 		detail += "，备注 " + truncate(req.Note, 200)
@@ -187,9 +225,25 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 
 	// 参数级错误必须在异步之前挡住：版本不存在、Docker 不可用这类问题
 	// 是立刻能判定的，让用户等一个注定失败的后台任务只会更困惑。
-	if _, verr := s.pickVersion(req.EngineVersion); verr != nil {
+	img, verr := s.pickVersionFor(engineName, req.EngineVersion)
+	if verr != nil {
 		s.fail(w, r, errBadRequest(verr.Error()))
 		return
+	}
+	// 自定义镜像地址：校验格式，并把版本号对齐到地址里的标签，
+	// 免得界面显示 17、实际拉的是 16（或反过来）
+	if ref := strings.TrimSpace(req.Image); ref != "" {
+		clean, ierr := normalizeImageRef(ref)
+		if ierr != nil {
+			s.fail(w, r, errBadRequest(ierr.Error()))
+			return
+		}
+		opts.Image = clean
+		if tag := imageTag(clean); tag != "" && tag != img.Tag {
+			if picked, ok := images.Find(tag); ok && picked.Family == familyOf(engineName) {
+				img = picked
+			}
+		}
 	}
 	if derr := s.dockerReady(r.Context()); derr != nil {
 		s.fail(w, r, derr)
@@ -211,7 +265,7 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	bg := r.Clone(context.WithoutCancel(r.Context()))
 	go func() {
 		phase := func(p, text string) { s.deployPhase(task.ID, p, text) }
-		in, perr := s.createMySQL(bg.Context(), name, profile, req.SeedSQL, req.EngineVersion, opts, phase)
+		in, perr := s.createService(bg.Context(), engineName, name, profile, req.SeedSQL, img.Tag, opts, phase)
 		if perr != nil {
 			// 失败时台账里已经留着这条（status=failed）记录，把 ID 一并交给前端，
 			// 用户才能在列表里点开看部署日志、删掉重来。
@@ -229,7 +283,8 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, false); !ok {
+	id, ok := s.require(w, r, false)
+	if !ok {
 		return
 	}
 	in, ok := s.load(w, r)
@@ -237,7 +292,9 @@ func (s *Server) handleGetInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeOK(w, r, s.viewWithStats(r.Context(), in))
+	v := s.viewWithStats(r.Context(), in)
+	s.applyAccess(r, id, &v)
+	writeOK(w, r, v)
 }
 
 // attachBackupStats 把备份份数与最近备份时间补到视图上；查不到就留零值，不影响主流程。
@@ -275,10 +332,18 @@ func (s *Server) viewWithStats(ctx context.Context, in store.Instance) instanceV
 // 表数量只是概览信息（多少张表值得关注），不拿字段与行数：那是数据库客户端的活。
 // 状态以容器真实情况为准，台账里的 status 只表示"应该处于什么状态"。
 func (s *Server) view(in store.Instance) instanceView {
-	v := instanceView{Instance: in}
+	v := instanceView{Instance: in, Capabilities: capabilitiesOf(in)}
 	v.Status = s.liveStatus(in)
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
+		return v
+	}
+	if isExternal(in) {
+		v.FilePath = net.JoinHostPort(in.Host, strconv.Itoa(in.Port))
+		v.SizeUnknown = true
+		if v.Status == "error" {
+			v.StatusReason = "外部数据库连接失败，请检查地址、账号、网络与 TLS 设置"
+		}
 		return v
 	}
 	v.FilePath = s.storageLabel(in)
@@ -294,6 +359,40 @@ func (s *Server) view(in store.Instance) instanceView {
 	return v
 }
 
+func capabilitiesOf(in store.Instance) instanceCapabilities {
+	if isExternal(in) {
+		return instanceCapabilities{
+			Users:          true,
+			Databases:      true,
+			Transfer:       in.Engine != engineMongoDB,
+			TestConnection: true,
+			Members:        true,
+		}
+	}
+	if in.Engine == engineMongoDB {
+		return instanceCapabilities{
+			StartStop: true, Container: true, Backup: true,
+			Users: true, Databases: true, TestConnection: true, RevealRoot: true,
+			DeletePermanent: true, ConfigFile: true,
+			Members: true,
+		}
+	}
+	return instanceCapabilities{
+		StartStop:       true,
+		Container:       true,
+		Config:          true,
+		ConfigFile:      true,
+		Backup:          true,
+		Users:           true,
+		Databases:       true,
+		Transfer:        true,
+		TestConnection:  true,
+		RevealRoot:      true,
+		DeletePermanent: true,
+		Members:         true,
+	}
+}
+
 // instanceSize 返回实例体积（数据目录合计），用于删除确认与概览统计。
 func (s *Server) instanceSize(in store.Instance) int64 {
 	dir := s.storageDir(in)
@@ -304,7 +403,7 @@ func (s *Server) instanceSize(in store.Instance) int64 {
 }
 
 func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.requireInstanceAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -321,6 +420,10 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(req.Name)
 	touchQuota := req.CPULimit != nil || req.MemLimitMB != nil
 	touchPort := req.Port != nil && *req.Port != in.Port
+	if isExternal(in) && (touchQuota || touchPort) {
+		s.fail(w, r, errBadRequest("外部连接不支持修改容器配额或端口，请修改连接配置"))
+		return
+	}
 	if name == "" && !touchQuota && !touchPort {
 		s.fail(w, r, errBadRequest("没有需要修改的字段"))
 		return
@@ -429,7 +532,7 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.requireInstanceAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -472,9 +575,16 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	// 实例要消失，容器不能留着：否则端口与内存被一个界面上看不见的服务占着。
 	// 保留数据时也要停：数据卷留着不等于让它继续跑。
 	// keepData=true 时连卷一起留着：以前这里无条件删卷，"保留数据"其实把数据删了
-	_ = s.removeDocker(r.Context(), in, !*req.KeepData)
-	_ = os.Remove(s.secretPath(in.ID))
-	_ = os.Remove(s.rootSecretPath(in.ID))
+	if isExternal(in) {
+		_ = removeIfExists(s.externalSecretPath(in.ID))
+	} else {
+		if err := s.removeDocker(r.Context(), in, !*req.KeepData); err != nil {
+			s.fail(w, r, errState("删除容器失败，服务仍保留："+err.Error()))
+			return
+		}
+		_ = os.Remove(s.secretPath(in.ID))
+		_ = os.Remove(s.rootSecretPath(in.ID))
+	}
 	// 配置行也属于这个实例：留着会让同名新实例继承上一份配置
 	if err := s.st.DeleteInstanceSettings(r.Context(), in.ID); err != nil {
 		s.fail(w, r, errInternal("清理配置失败"))
@@ -483,7 +593,7 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	// 定时备份策略同理：实例没了还要策略，调度器会一直报"实例不存在"
 	_ = s.st.DeletePolicy(r.Context(), in.ID)
 
-	if !*req.KeepData {
+	if !*req.KeepData && !isExternal(in) {
 		src := s.instanceDir(in)
 		dst := filepath.Join(s.paths.Trash, in.ID+"-"+strconv.FormatInt(time.Now().Unix(), 10))
 		if err := os.MkdirAll(s.paths.Trash, 0o750); err != nil {
@@ -513,7 +623,7 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	// 绑挂到宿主目录的数据我们不动手：那是用户自己的目录，可能在别的应用里也用着，
 	// 界面删掉实例就顺手删掉一整个宿主目录太危险，宁可留一句可执行的提示。
-	if in.StorageKind != storageVolume && !*req.KeepData {
+	if !isExternal(in) && in.StorageKind != storageVolume && !*req.KeepData {
 		// 绑挂目录可能被用户放在别处（例如 /vol1/mysql/blog），
 		// 只删我们自己管理的默认目录，别的地方给一句可执行提示。
 		if in.StoragePath == "" {
@@ -522,7 +632,7 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 			detail += "，宿主目录 " + in.StoragePath + " 未删除，请按需自行清理"
 		}
 	}
-	if *req.KeepData {
+	if !isExternal(in) && *req.KeepData {
 		detail += "，数据保留在 " + s.storageLabel(in)
 	}
 	s.audit(r, id, "instance.delete", "instance", in.ID, "ok", detail)
@@ -677,6 +787,77 @@ func normalizeCreateOpts(req createInstanceReq) (createOpts, error) {
 		return opts, errBadRequest("不能把根目录当作数据目录")
 	}
 	return opts, nil
+}
+
+// validateStoragePath 只允许把数据放到应用私有目录或飞牛授权的数据共享目录。
+//
+// Docker bind mount 等于把宿主目录交给容器里的数据库进程。入口镜像通常会对数据目录
+// 做 chown，如果允许任意绝对路径，一次手误就可能把系统目录或别的应用目录交给容器。
+func (s *Server) validateStoragePath(path string) error {
+	if path == "" {
+		return nil
+	}
+	clean := filepath.Clean(path)
+	if clean == "/" {
+		return errBadRequest("不能把根目录当作数据目录")
+	}
+	roots := []string{filepath.Join(s.env.PkgVar, "instances")}
+	roots = append(roots, s.env.DataSharePaths...)
+	if len(s.env.DataSharePaths) == 0 && !s.env.InPlatform {
+		roots = append(roots, filepath.Join(os.TempDir(), "niudbm-dev"))
+	}
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		cleanRoot, rerr := resolvePath(root)
+		cleanCandidate, cerr := resolvePath(clean)
+		if rerr != nil || cerr != nil {
+			continue
+		}
+		if cleanCandidate == cleanRoot {
+			return errBadRequest("请选择授权目录下的子目录，不要直接使用目录根路径")
+		}
+		if pathWithin(cleanRoot, cleanCandidate) {
+			return nil
+		}
+	}
+	return errBadRequest("数据目录必须位于飞牛授权的 niudbm/data 或应用私有数据目录下")
+}
+
+// resolvePath 解析路径中已经存在的部分，再拼回尚不存在的目录。
+// 这样既能处理"首次部署目录还不存在"，也能拦住授权目录里指向 /etc 的软链接。
+func resolvePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := absolute
+	var missing []string
+	for {
+		resolved, evalErr := filepath.EvalSymlinks(current)
+		if evalErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(evalErr) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return absolute, nil
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathWithin(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return rel != "." && !filepath.IsAbs(rel)
 }
 
 // quotaText 把配额格式化成审计与界面都能读的一句话。

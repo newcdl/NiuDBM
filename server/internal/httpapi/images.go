@@ -22,7 +22,10 @@ func (s *Server) imageUsage(ctx context.Context) map[string][]string {
 		return usage
 	}
 	for _, in := range list {
-		usage[in.EngineVersion] = append(usage[in.EngineVersion], in.Name)
+		if isExternal(in) {
+			continue
+		}
+		usage[in.Engine+":"+in.EngineVersion] = append(usage[in.Engine+":"+in.EngineVersion], in.Name)
 	}
 	return usage
 }
@@ -61,7 +64,7 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 			Tag: img.Tag, Name: img.Name, Family: img.Family, Label: img.Label,
 			Note: img.Note, Archs: img.Archs, Supports: img.Supports(s.arch()),
 			Default: img.Default,
-			UsedBy:  usage[img.Tag],
+			UsedBy:  usage[img.Family+":"+img.Tag],
 		}
 		if item.UsedBy == nil {
 			item.UsedBy = []string{}
@@ -82,11 +85,14 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 		"total":    len(items),
 		"dockerOk": dockerOK,
 		"arch":     s.arch(),
+		// 加速站前缀：界面要用它拼出"实际会去拉的地址"，让用户能改
+		"dockerMirror": s.env.DockerMirror,
 	})
 }
 
 type pullImageReq struct {
-	Tag string `json:"tag"`
+	Tag    string `json:"tag"`
+	Family string `json:"family"`
 }
 
 // handlePullImage 现在就把镜像拉到本机，不用等到部署时再等。
@@ -104,6 +110,9 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	img, found := images.Find(req.Tag)
+	if req.Family != "" {
+		img, found = images.FindFamily(req.Family, req.Tag)
+	}
 	if !found {
 		s.fail(w, r, errBadRequest("没有这个版本："+req.Tag))
 		return
@@ -124,10 +133,14 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jobID := s.beginJob(id, jobImagePull, "image", img.Tag, img.Name)
+	jobID := s.beginJob(id, jobImagePull, "image", img.Family+":"+img.Tag, img.Name)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	s.registerJobCancel(jobID, cancel)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
+		defer func() {
+			cancel()
+			s.unregisterJobCancel(jobID)
+		}()
 		s.setJobProgress(jobID, 10)
 		name, err := s.ensureImage(ctx, client, img.Name)
 		if err != nil {
@@ -137,8 +150,8 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		s.setJobProgress(jobID, 100)
 		s.finishJob(jobID, store.JobSucceeded, "已就绪："+name, "")
 	}()
-	s.audit(r, id, "image.pull", "image", img.Tag, "ok", "开始拉取 "+img.Name)
-	writeAccepted(w, r, map[string]any{"async": true, "jobId": jobID, "image": img.Name})
+	s.audit(r, id, "image.pull", "image", img.Family+":"+img.Tag, "ok", "开始拉取 "+img.Name)
+	writeAccepted(w, r, map[string]any{"async": true, "jobId": jobID, "image": img.Name, "family": img.Family})
 }
 
 // handleDeleteImage 删除本地镜像。
@@ -152,12 +165,16 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag := r.PathValue("tag")
+	family := strings.TrimSpace(r.URL.Query().Get("family"))
 	img, found := images.Find(tag)
+	if family != "" {
+		img, found = images.FindFamily(family, tag)
+	}
 	if !found {
 		s.fail(w, r, errNotFound("没有这个版本："+tag))
 		return
 	}
-	if users := s.imageUsage(r.Context())[img.Tag]; len(users) > 0 {
+	if users := s.imageUsage(r.Context())[img.Family+":"+img.Tag]; len(users) > 0 {
 		s.fail(w, r, errState(fmt.Sprintf(
 			"还有 %d 个服务在用 %s（%s）：先删掉这些服务，或把它们换到别的版本",
 			len(users), img.Name, strings.Join(users, "、"))))
@@ -189,6 +206,6 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errNotFound("本地没有 "+img.Name))
 		return
 	}
-	s.audit(r, id, "image.delete", "image", img.Tag, "ok", "删除本地镜像 "+img.Name)
+	s.audit(r, id, "image.delete", "image", img.Family+":"+img.Tag, "ok", "删除本地镜像 "+img.Name)
 	writeOK(w, r, map[string]any{"message": "已从本机删除 " + img.Name})
 }

@@ -40,9 +40,10 @@ func newTestEnv(t *testing.T, inPlatform bool) *testEnv {
 		Instances: filepath.Join(root, "instances"),
 		Backups:   filepath.Join(root, "backups"),
 		Trash:     filepath.Join(root, "trash"),
+		Secrets:   filepath.Join(root, "secrets"),
 		Meta:      filepath.Join(root, "niudbm.db"),
 	}
-	for _, dir := range []string{paths.Instances, paths.Backups, paths.Trash} {
+	for _, dir := range []string{paths.Instances, paths.Backups, paths.Trash, paths.Secrets} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -189,15 +190,15 @@ func TestDuplicateInstanceName(t *testing.T) {
 	}
 }
 
-// TestCreateRejectsNonMySQL 产品只做 MySQL：其它引擎必须明确拒绝，
-// 而不是悄悄建成一个 MySQL。
-func TestCreateRejectsNonMySQL(t *testing.T) {
+// TestCreateRejectsUnknownEngine 只支持 MySQL、PostgreSQL 与 MongoDB：
+// 其它引擎必须明确拒绝，而不是悄悄建成一个 MySQL。
+func TestCreateRejectsUnknownEngine(t *testing.T) {
 	e := newTestEnv(t, false)
-	for _, engine := range []string{"sqlite", "postgres"} {
+	for _, engine := range []string{"sqlite", "redis"} {
 		code, resp := e.call(t, http.MethodPost, "/api/v1/instances", nil, map[string]any{
 			"name": "别的引擎-" + engine, "engine": engine,
 		})
-		if code != http.StatusBadRequest || !strings.Contains(resp.Message, "只支持 MySQL") {
+		if code != http.StatusBadRequest || !strings.Contains(resp.Message, "不支持的引擎") {
 			t.Fatalf("%s 应被拒，得到 %d：%s", engine, code, resp.Message)
 		}
 	}
@@ -231,7 +232,9 @@ func TestCreateValidatesUsers(t *testing.T) {
 	}
 }
 
-// TestPermissionInPlatform 网关注入身份：没身份 401、普通用户只读、管理员可写。
+// TestPermissionInPlatform 网关注入身份：没会话 401、普通成员可登录但只能读取空授权列表、管理员可写。
+//
+// Header 只用于「换一次会话」，业务接口只认会话；这里覆盖登录与会话链路。
 func TestPermissionInPlatform(t *testing.T) {
 	e := newTestEnv(t, true)
 
@@ -240,31 +243,48 @@ func TestPermissionInPlatform(t *testing.T) {
 		t.Fatalf("无身份应 401，得到 %d", code)
 	}
 
-	user := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "普通用户"}
-	if code, _ := e.call(t, http.MethodGet, "/api/v1/instances", user, nil); code != http.StatusOK {
-		t.Fatalf("普通用户应可读，得到 %d", code)
+	userHeaders := map[string]string{
+		"X-Trim-Userid": "1001", "X-Trim-Username": "普通用户", "X-Trim-Isadmin": "false",
 	}
-	code, resp := e.call(t, http.MethodPost, "/api/v1/instances", user, map[string]any{"name": "x"})
-	if code != http.StatusUnauthorized || !strings.Contains(resp.Message, "管理员") {
-		t.Fatalf("普通用户写操作应 401，得到 %d：%s", code, resp.Message)
+	userCookie := e.loginCookie(t, userHeaders)
+	if code, _ := e.call(t, http.MethodGet, "/api/v1/instances", map[string]string{"Cookie": userCookie}, nil); code != http.StatusOK {
+		t.Fatalf("普通成员登录后应能读取被授权的空列表，得到 %d", code)
+	}
+	if code, _ := e.call(t, http.MethodGet, "/api/v1/settings", map[string]string{"Cookie": userCookie}, nil); code != http.StatusForbidden {
+		t.Fatalf("普通成员不应读取全局设置，得到 %d", code)
+	}
+	if code, _ := e.call(t, http.MethodGet, "/api/v1/instances", userHeaders, nil); code != http.StatusUnauthorized {
+		t.Fatalf("只有身份头没有会话，业务接口应 401，得到 %d", code)
+	}
+
+	// 管理员：先换会话，再带着 Cookie 访问
+	admin := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "管理员", "X-Trim-Isadmin": "true"}
+	cookie := e.loginCookie(t, admin)
+	withCookie := map[string]string{"Cookie": cookie}
+
+	if code, _ := e.call(t, http.MethodGet, "/api/v1/instances", withCookie, nil); code != http.StatusOK {
+		t.Fatalf("管理员登录后应可读，得到 %d", code)
+	}
+	// 只带身份头、不带会话，仍然拒绝：这正是"退出登录之后又被自动带进来"的旧毛病
+	code, resp := e.call(t, http.MethodPost, "/api/v1/instances", admin, map[string]any{"name": "管理员建的", "engine": "postgres"})
+	if code != http.StatusUnauthorized {
+		t.Fatalf("只有身份头没有会话应 401，得到 %d：%s", code, resp.Message)
 	}
 
 	// 管理员可写：用"不支持的引擎"作为探针，既能验证放行又不会真的起容器
-	admin := map[string]string{"X-Trim-Userid": "1001", "X-Trim-Username": "管理员", "X-Trim-Isadmin": "true"}
-	code, resp = e.call(t, http.MethodPost, "/api/v1/instances", admin, map[string]any{"name": "管理员建的", "engine": "postgres"})
+	code, resp = e.call(t, http.MethodPost, "/api/v1/instances", withCookie, map[string]any{"name": "管理员建的", "engine": "sqlite"})
 	if code != http.StatusBadRequest || strings.Contains(resp.Message, "管理员") {
 		t.Fatalf("管理员应通过鉴权（业务 400 而不是 401），得到 %d：%s", code, resp.Message)
 	}
 
-	// 审计里应记录真实网关身份（审计仅管理员可读）
-	// 写操作审计只落成功的动作，这里直接塞一条，专测"记录的是网关身份"
+	// 审计里应记录真实网关身份
 	if err := e.st.AddAudit(t.Context(), store.Audit{
 		Ts: time.Now().UnixMilli(), UserID: "1001", Username: "管理员",
 		Action: "instance.create", Result: "ok", Detail: "测试",
 	}); err != nil {
 		t.Fatalf("写入审计失败：%v", err)
 	}
-	auditCode, auditResp := e.call(t, http.MethodGet, "/api/v1/audit", admin, nil)
+	auditCode, auditResp := e.call(t, http.MethodGet, "/api/v1/audit", withCookie, nil)
 	if auditCode != http.StatusOK {
 		t.Fatalf("管理员读审计应 200，得到 %d：%s", auditCode, auditResp.Message)
 	}

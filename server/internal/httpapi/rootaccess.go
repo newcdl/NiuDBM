@@ -24,6 +24,14 @@ func (s *Server) handleGetRootAccess(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库的账号由原数据库管理，本应用不修改其 root/超级用户"))
+		return
+	}
+	if in.Engine == enginePostgres {
+		s.fail(w, r, errBadRequest("PostgreSQL 没有 root@host 这种账号：来源由 pg_hba.conf 控制，默认已允许密码登录"))
+		return
+	}
 	spec, err := s.mysqlSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
@@ -46,7 +54,7 @@ func (s *Server) handleGetRootAccess(w http.ResponseWriter, r *http.Request) {
 // 关掉之后外部只能用业务账号连，root 只在容器内可用；这是收敛攻击面的常规做法，
 // 但开了又关时 root@'%' 会被删掉，因此界面上必须明确提示。
 func (s *Server) handleSetRootAccess(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.requireInstanceAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -54,9 +62,17 @@ func (s *Server) handleSetRootAccess(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库的账号由原数据库管理，本应用不修改其 root/超级用户"))
+		return
+	}
 	var req rootAccessReq
 	if err := decodeJSON(r, &req); err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	if in.Engine == enginePostgres {
+		s.fail(w, r, errBadRequest("PostgreSQL 没有 root@host 这种账号：来源由 pg_hba.conf 控制，默认已允许密码登录"))
 		return
 	}
 	spec, err := s.mysqlSpec(in)
@@ -95,12 +111,16 @@ type rootPasswordReq struct {
 // 改完把新密码写回实例的 root-secret，概览与连接信息里显示的就是它；
 // 容器环境变量里的旧密码不会覆盖已初始化的数据目录，所以重启也不会回退。
 func (s *Server) handleSetRootPassword(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.requireInstanceAdmin(w, r)
 	if !ok {
 		return
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库的账号由原数据库管理，本应用不修改其 root/超级用户"))
 		return
 	}
 	var req rootPasswordReq
@@ -119,6 +139,10 @@ func (s *Server) handleSetRootPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if in.Engine == enginePostgres {
+		s.fail(w, r, errBadRequest("PostgreSQL 没有 root@host 这种账号：来源由 pg_hba.conf 控制，默认已允许密码登录"))
+		return
+	}
 	spec, err := s.mysqlSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
@@ -165,6 +189,18 @@ func (s *Server) handleGetConfigFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部数据库的配置文件不在本机，暂不支持在线修改"))
+		return
+	}
+	if in.Engine == enginePostgres {
+		s.servePgConfigFile(w, r, in)
+		return
+	}
+	if in.Engine == engineMongoDB {
+		s.serveMongoConfigFile(w, r, in)
+		return
+	}
 	path := s.confFilePath(in)
 	content := ""
 	if raw, err := os.ReadFile(path); err == nil {
@@ -177,7 +213,7 @@ func (s *Server) handleGetConfigFile(w http.ResponseWriter, r *http.Request) {
 	// 推荐模板与缺失项都不落盘：老实例的文件可能只有几行，前端据此提示并可一键补全
 	suggested := ""
 	missing := []string{}
-	if spec, err := s.mysqlSpec(in); err == nil {
+	if spec, err := s.mysqlSpec(in); err == nil && in.Engine != enginePostgres {
 		suggested = spec.CnfTemplate()
 		missing = spec.CnfMissing(content)
 	}
@@ -187,6 +223,14 @@ func (s *Server) handleGetConfigFile(w http.ResponseWriter, r *http.Request) {
 		"backupExists": backupErr == nil,
 		"suggested":    suggested,
 		"missing":      missing,
+		"running":      true,
+		// 与 PG 的响应形状对齐：界面用同一套"文件清单 + 当前文件"来渲染，
+		// MySQL 只有一个文件，PG 有三个
+		"selected": "niudbm.cnf",
+		"files": []map[string]any{{
+			"name": "niudbm.cnf", "label": "niudbm.cnf", "writable": true,
+			"note": "conf.d 片段：覆盖默认参数，重启后生效",
+		}},
 	})
 }
 
@@ -205,6 +249,18 @@ func (s *Server) handlePutConfigFile(w http.ResponseWriter, r *http.Request) {
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部数据库的配置文件不在本机，暂不支持在线修改"))
+		return
+	}
+	if in.Engine == enginePostgres {
+		s.savePgConfigFile(w, r, in)
+		return
+	}
+	if in.Engine == engineMongoDB {
+		s.saveMongoConfigFile(w, r, id, in)
 		return
 	}
 	var req configFileReq
@@ -256,6 +312,18 @@ func (s *Server) handleRestoreConfigFile(w http.ResponseWriter, r *http.Request)
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部数据库的配置文件不在本机，暂不支持在线修改"))
+		return
+	}
+	if in.Engine == enginePostgres {
+		s.restorePgConfigFile(w, r, in)
+		return
+	}
+	if in.Engine == engineMongoDB {
+		s.restoreMongoConfigFile(w, r, id, in)
 		return
 	}
 	path := s.confFilePath(in)

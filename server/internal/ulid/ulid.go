@@ -6,7 +6,6 @@ package ulid
 
 import (
 	"crypto/rand"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -78,30 +77,4 @@ func encode(ms int64, tail [10]byte) string {
 		out[i] = alphabet[v]
 	}
 	return string(out[:])
-}
-
-// ParseTime 取回 ULID 内的毫秒时间戳，用于展示"创建于"而不必多存一列。
-func ParseTime(id string) (time.Time, error) {
-	if len(id) != 26 {
-		return time.Time{}, fmt.Errorf("ulid 长度非法: %d", len(id))
-	}
-	var ms int64
-	for i := 0; i < 10; i++ {
-		v := indexOf(id[i])
-		if v < 0 {
-			return time.Time{}, fmt.Errorf("ulid 含非法字符: %q", id[i])
-		}
-		ms = ms<<5 | int64(v)
-	}
-	// 前 10 个字符共 50 位，其中低 48 位为时间戳
-	return time.UnixMilli(ms & 0xFFFFFFFFFFFF), nil
-}
-
-func indexOf(c byte) int {
-	for i := 0; i < len(alphabet); i++ {
-		if alphabet[i] == c {
-			return i
-		}
-	}
-	return -1
 }

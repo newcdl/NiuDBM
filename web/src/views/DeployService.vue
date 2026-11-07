@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { api, type DeployTask, type ImageInfo } from '../api'
+import { ElMessage } from 'element-plus'
+import { api, engineLabel, type DeployTask, type ImageInfo } from '../api'
 import { copyText, randomPassword } from '../clip'
 import { errText } from '../format'
 
@@ -9,6 +10,8 @@ import { errText } from '../format'
 const props = defineProps<{
   // 从镜像页/列表带过来的预选版本（镜像 tag）
   version?: string
+  // 要部署的引擎：mysql / postgres。两套版本号会撞号，必须按 family 过滤
+  engine?: string
 }>()
 const emit = defineEmits<{ done: [name: string, port: number, id: string]; cancel: [] }>()
 
@@ -21,15 +24,22 @@ const dockerNote = ref('')
 const loadError = ref('')
 const loading = ref(false)
 const arch = ref('')
+// 加速站来自后端配置（NIUDBM_DOCKER_MIRROR）；有它时默认地址就带上前缀，
+// 让用户看到"到底会去哪个地址拉"，而不是以为地址是写死的
+const dockerMirror = ref('')
+// 用户手动改过地址后，切换版本不再覆盖他的输入
+const imageTouched = ref(false)
 
-const versions = computed(() => images.value.filter((img) => img.supports))
+const engine = computed(() => props.engine || 'mysql')
+// 版本清单按引擎过滤：MySQL 的 8.4 与 PG 的 16 不能出现在同一个下拉里
+const versions = computed(() => images.value.filter((img) => img.supports && img.family === engine.value))
 
 const blockedReason = computed(() => {
   if (loadError.value) return `镜像清单没读到：${loadError.value}`
   if (!dockerOk.value) {
     return dockerNote.value ? `Docker 不可用：${dockerNote.value}` : '读不到 Docker，无法拉起容器。'
   }
-  if (!versions.value.length) return '当前架构没有可部署的 MySQL 镜像。'
+  if (!versions.value.length) return `当前架构没有可部署的 ${engineLabel(engine.value)} 镜像。`
   return ''
 })
 
@@ -40,6 +50,7 @@ async function loadImages(): Promise<void> {
     images.value = list.items
     dockerOk.value = list.dockerOk
     arch.value = list.arch
+    dockerMirror.value = list.dockerMirror ?? ''
     loadError.value = ''
   } catch (e) {
     images.value = []
@@ -61,6 +72,8 @@ async function loadImages(): Promise<void> {
 const form = ref({
   name: '',
   engineVersion: '',
+  // image 是真正拉取的地址：默认按清单+加速站拼好，用户可改（私有仓库/换加速站）
+  image: '',
   rootPassword: '',
   cpuLimit: 0,
   memLimitMB: 0,
@@ -118,11 +131,70 @@ const portNumber = computed(() => {
   return raw ? Number(raw) : 0
 })
 
+/**
+ * 服务名校验，规则与后端 validateName 一致。
+ *
+ * 前端必须自己先拦一次：名字不合法只有后端知道时，用户要走到最后一步才看到错，
+ * 中间三步白填——这正是"为什么到最后才提示名字不对"的由来。
+ */
+function nameIssue(v: string): string {
+  const name = v.trim()
+  if (!name) return '请填写服务名称'
+  if ([...name].length > 32) return '服务名最多 32 个字符'
+  if (name.includes('..')) return '服务名不能包含 ..'
+  if (/[\u0000-\u001f]/.test(name)) return '服务名不能包含控制字符'
+  if (/[\/:*?"<>|]/.test(name)) return '服务名不能包含 / \\ : * ? " < > |'
+  return ''
+}
+
+const nameError = computed(() => nameIssue(form.value.name))
+
+/** 镜像地址校验：必须是完整引用且带版本标签（否则会悄悄拉 latest）。 */
+function imageIssue(v: string): string {
+  const ref = v.trim()
+  if (!ref) return '请填写镜像地址'
+  if (!/^[A-Za-z0-9._\-/:@]+$/.test(ref)) return '镜像地址只能包含字母、数字与 . _ - / : @'
+  const slash = ref.lastIndexOf('/')
+  const colon = ref.lastIndexOf(':')
+  if (ref.includes('@') || colon < 0 || colon < slash || colon === ref.length - 1) {
+    return '镜像地址要带版本标签，例如 docker.m.daocloud.io/library/postgres:17'
+  }
+  return ''
+}
+
+const imageError = computed(() => imageIssue(form.value.image))
+
+/** 清单里的"官方地址"，配上加速站前缀后作为默认值。 */
+function defaultImageFor(name: string): string {
+  const mirror = dockerMirror.value.replace(/\/+$/, '')
+  return mirror ? `${mirror}/library/${name}` : name
+}
+
+const suggestedImage = computed(() => {
+  const name = chosen.value?.name ?? ''
+  return name ? defaultImageFor(name) : ''
+})
+
+// 版本变了就把地址跟着改（除非用户自己改过）
+watch(suggestedImage, (next) => {
+  if (next && !imageTouched.value) form.value.image = next
+})
+
+function resetImage(): void {
+  if (!suggestedImage.value) return
+  form.value.image = suggestedImage.value
+  imageTouched.value = false
+}
+
 function stepError(key: string): string {
   if (key === 'version') {
-    if (!form.value.name.trim()) return '请填写服务名称'
-    if (!versions.value.length) return blockedReason.value
-    if (!form.value.engineVersion) return '请选择镜像版本'
+    const bad = nameIssue(form.value.name)
+    if (bad) return bad
+    // 版本清单读不到时不再一刀切拦住：只要手上有可用地址，就允许继续
+    if (!versions.value.length && !form.value.image.trim()) return blockedReason.value
+    if (versions.value.length && !form.value.engineVersion) return '请选择镜像版本'
+    const badImage = imageIssue(form.value.image)
+    if (badImage) return badImage
     return ''
   }
   if (key === 'secret') {
@@ -152,6 +224,7 @@ function nextStep(): void {
   const err = stepError(currentStep.value)
   if (err) {
     formError.value = err
+    ElMessage.warning(err)
     return
   }
   formError.value = ''
@@ -254,7 +327,10 @@ async function submit(): Promise<void> {
   try {
     const res = await api.createInstance({
       name: form.value.name.trim(),
+      engine: engine.value,
       engineVersion: form.value.engineVersion,
+      // 地址随请求一起发：后端按它拉镜像，并记进台账供重建容器时沿用
+      image: form.value.image.trim(),
       profile: 'standard',
       rootPassword: form.value.rootPassword || undefined,
       cpuLimit: form.value.cpuLimit || undefined,
@@ -272,8 +348,19 @@ async function submit(): Promise<void> {
     emit('done', res.name, res.port ?? 0, res.id)
   } catch (e) {
     stopTimers()
-    deployError.value = errText(e)
+    // 请求在拿到任务号之前就失败（重名、Docker 不可用、版本不支持、会话过期…）：
+    // 这时进度卡不会出现，必须把原因留在表单上并弹一次提示，
+    // 否则界面表现就是"点一下、闪一下、什么都没发生"。
+    const msg = errText(e)
+    // 最常见的两种"点不动"：名字被上次失败的部署占了、Docker 根本没就绪。
+    // 都直接告诉用户下一步做什么，而不是只报一句错。
+    deployError.value = msg.includes('已存在')
+      ? `${msg}（通常是上次部署失败留下的记录：在列表里删掉那条，或换个名字重试）`
+      : msg
+    formError.value = deployError.value
     deploying.value = false
+    task.value = null
+    ElMessage.error(deployError.value)
   }
 }
 
@@ -312,6 +399,19 @@ async function viewDeployLog(): Promise<void> {
 
 // 失败记录会留在列表里（便于看日志），同名再部署会撞名字。
 // 所以"修改后重试"先把这条失败实例删掉，再回到表单重新填。
+/** 拉取失败后：改地址 → 清掉失败现场 → 用新地址再部署一次。 */
+async function retryWithImage(): Promise<void> {
+  const bad = imageIssue(form.value.image)
+  if (bad) {
+    ElMessage.warning(bad)
+    return
+  }
+  imageTouched.value = true
+  await retry()
+  if (deployError.value) return
+  await submit()
+}
+
 async function retry(): Promise<void> {
   const id = task.value?.instanceId
   if (id) {
@@ -341,7 +441,7 @@ onBeforeUnmount(stopTimers)
   <div class="deploy">
     <div class="deploy-head">
       <button type="button" class="btn btn-sm" :disabled="deploying" @click="emit('cancel')">← 返回列表</button>
-      <h2>部署 MySQL 服务</h2>
+      <h2>部署 {{ engineLabel(engine) }} 服务</h2>
       <span class="muted small">一个服务占一个端口；服务建好后，进去再建数据库。</span>
     </div>
 
@@ -377,6 +477,25 @@ onBeforeUnmount(stopTimers)
 
       <div v-if="deployError" class="notice notice-bad">
         <span>{{ deployError }}</span>
+      </div>
+
+      <!-- 拉取失败最常见的原因就是地址连不上：就地改，别再回第一步翻 -->
+      <div v-if="deployError" class="field">
+        <label for="d-image-retry">换个镜像地址再试</label>
+        <div class="row">
+          <input
+            id="d-image-retry"
+            v-model="form.image"
+            class="input mono"
+            spellcheck="false"
+            placeholder="docker.m.daocloud.io/library/postgres:17"
+            @input="imageTouched = true"
+          />
+          <button type="button" class="btn" :disabled="deploying" @click="retryWithImage">用这个地址重试</button>
+        </div>
+        <span class="field-hint">
+          会先删掉上面这条失败记录（不含数据目录），再用新地址部署一次。地址必须带版本标签。
+        </span>
       </div>
 
       <p v-if="deployError" class="muted small">
@@ -437,10 +556,11 @@ onBeforeUnmount(stopTimers)
               v-model="form.name"
               class="input"
               maxlength="32"
-              :placeholder="'例如 mysql-业务'"
+              :placeholder="`例如 ${engine === 'postgres' ? 'pg' : 'mysql'}-业务`"
             />
-            <span class="field-hint">
-              最多 32 个字符，不能包含 / \ : * ? " &lt; &gt; |；服务里的数据库另有名字。
+            <span v-if="nameError && form.name" class="field-hint bad-text">{{ nameError }}</span>
+            <span v-else class="field-hint">
+              最多 32 个字符，不能包含 / \ : * ? " &lt; &gt; |；点「下一步」时就会校验，不用等到最后。
             </span>
           </div>
 
@@ -455,6 +575,36 @@ onBeforeUnmount(stopTimers)
               版本决定 SQL 兼容性，建好后不能原地换版本；换版本请部署新的服务再迁移数据。
               <template v-if="chosen?.note"> {{ chosen.note }}。</template>
               <template v-if="arch"> 当前架构 {{ arch }}。</template>
+            </span>
+          </div>
+
+          <!-- 镜像地址：国内网络常常拉不动 Docker Hub，必须让用户自己改 -->
+          <div class="field">
+            <label for="d-image">镜像地址</label>
+            <div class="row">
+              <input
+                id="d-image"
+                v-model="form.image"
+                class="input mono"
+                spellcheck="false"
+                :placeholder="suggestedImage || 'docker.m.daocloud.io/library/postgres:17'"
+                @input="imageTouched = true"
+              />
+              <button
+                v-if="suggestedImage && form.image !== suggestedImage"
+                type="button"
+                class="btn btn-sm"
+                @click="resetImage"
+              >
+                恢复默认
+              </button>
+            </div>
+            <span v-if="imageError && form.image" class="field-hint bad-text">{{ imageError }}</span>
+            <span v-else class="field-hint">
+              实际就拉这个地址，必须带版本标签。
+              <template v-if="dockerMirror">已按加速站 <span class="mono">{{ dockerMirror }}</span> 补全；</template>
+              拉不动时可以换成自己的加速站或私有仓库，例如
+              <span class="mono">docker.m.daocloud.io/library/{{ chosen?.name || 'postgres:17' }}</span>。
             </span>
           </div>
         </template>
@@ -505,8 +655,8 @@ onBeforeUnmount(stopTimers)
           </div>
           <div v-if="form.storageKind === 'bind'" class="field">
             <label for="d-storage">宿主机目录</label>
-            <input id="d-storage" v-model="form.storagePath" class="input mono" placeholder="留空使用应用数据目录，例如 /vol1/mysql/blog" />
-            <span class="field-hint">绝对路径；首次部署会自动建目录。</span>
+            <input id="d-storage" v-model="form.storagePath" class="input mono" placeholder="留空使用应用数据目录；也可填授权共享目录下的子目录" />
+            <span class="field-hint">只允许飞牛授权目录或应用私有数据目录下的子目录，避免误挂系统目录。</span>
           </div>
         </template>
 
@@ -523,7 +673,7 @@ onBeforeUnmount(stopTimers)
             />
             <span class="field-hint">
               一个服务一个端口。容器在 Docker 里的名字就是
-              <code>mysql-{{ form.engineVersion || '版本' }}-{{ portNumber || '端口' }}</code>。
+              <code>{{ engine }}-{{ form.engineVersion || '版本' }}-{{ portNumber || '端口' }}</code>。
             </span>
           </div>
 
@@ -538,12 +688,13 @@ onBeforeUnmount(stopTimers)
             <select id="d-mem" v-model.number="form.memLimitMB" class="select">
               <option v-for="m in MEM_CHOICES" :key="m.value" :value="m.value">{{ m.label }}</option>
             </select>
-            <span class="field-hint">MySQL 官方镜像建议至少 512MB；超限会被 Docker OOM 杀掉。</span>
+            <span class="field-hint">{{ engineLabel(engine) }} 官方镜像建议至少 512MB；超限会被 Docker OOM 杀掉。</span>
           </div>
 
           <dl class="summary">
             <div><dt>服务名</dt><dd>{{ form.name || '—' }}</dd></div>
-            <div><dt>版本</dt><dd>{{ form.engineVersion || '—' }}</dd></div>
+            <div><dt>版本</dt><dd>{{ form.engineVersion || '默认' }}</dd></div>
+            <div class="wide"><dt>镜像</dt><dd class="mono">{{ form.image || '—' }}</dd></div>
             <div><dt>运行方式</dt><dd>Docker 容器</dd></div>
             <div><dt>端口</dt><dd>{{ portNumber || '自动分配' }}</dd></div>
           </dl>
@@ -552,6 +703,7 @@ onBeforeUnmount(stopTimers)
 
         <div v-if="copyHint" class="notice notice-ok">{{ copyHint }}</div>
         <div v-if="formError" class="notice notice-bad">{{ formError }}</div>
+        <div v-else-if="deployError" class="notice notice-bad">{{ deployError }}</div>
       </section>
 
       <div class="deploy-foot">
@@ -684,6 +836,16 @@ onBeforeUnmount(stopTimers)
 
 .summary dt {
   color: var(--fg-muted);
+}
+
+/* 镜像地址较长，独占一行并允许折行，避免把汇总撑破 */
+.summary .wide {
+  display: block;
+}
+
+.summary .wide dd {
+  margin: 2px 0 0;
+  word-break: break-all;
 }
 
 .summary dd {

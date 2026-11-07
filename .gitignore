@@ -29,6 +29,7 @@ bin/
 
 # 前端
 node_modules/
+.pnpm-store/
 .vite/
 coverage/
 

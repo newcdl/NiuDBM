@@ -19,6 +19,9 @@ import (
 // innodb_redo_log_capacity、slow_query_log_file 写成相对路径。
 func TestCnfCompatibleWithEveryImage(t *testing.T) {
 	for _, img := range images.List() {
+		if img.Family != images.FamilyMySQL && img.Family != images.FamilyMariaDB {
+			continue
+		}
 		img := img
 		t.Run(img.Name, func(t *testing.T) {
 			spec := Spec{Flavor: img.Family, Series: img.Tag}
@@ -56,6 +59,28 @@ func TestCnfCompatibleWithEveryImage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestInitialCnfVersionDefaults(t *testing.T) {
+	mariadb := (Spec{Flavor: "mariadb", Series: "11.4"}).initialCnf()
+	if mariadb["key_buffer_size"] != "128M" ||
+		mariadb["table_open_cache"] != "2000" ||
+		mariadb["max_allowed_packet"] != "16M" {
+		t.Fatalf("MariaDB 默认值不正确：%v", mariadb)
+	}
+	mysql84 := (Spec{Flavor: "mysql", Series: "8.4"}).initialCnf()
+	if mysql84["key_buffer_size"] != "8M" ||
+		mysql84["table_open_cache"] != "4000" ||
+		mysql84["max_allowed_packet"] != "64M" {
+		t.Fatalf("MySQL 8.4 默认值不正确：%v", mysql84)
+	}
+	mysql57 := (Spec{Flavor: "mysql", Series: "5.7"}).initialCnf()
+	if mysql57["character_set_server"] != "utf8mb4" || mysql57["collation_server"] != "utf8mb4_general_ci" {
+		t.Fatalf("MySQL 5.7 字符集推荐值不正确：%v", mysql57)
+	}
+	if _, ok := mysql84["lower_case_table_names"]; ok {
+		t.Fatal("lower_case_table_names 只能在初始化前设置，不应出现在可编辑模板")
 	}
 }
 

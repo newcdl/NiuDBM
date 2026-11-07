@@ -29,7 +29,7 @@ import (
 )
 
 // version 由构建脚本通过 -ldflags 注入，默认值便于 go run 时区分。
-var version = "0.1.12-dev"
+var version = "1.0.0"
 
 func main() {
 	socketPath := flag.String("socket", "", "Unix socket 路径（网关模式）")
@@ -60,6 +60,12 @@ func main() {
 		log.Fatalf("打开元数据库失败 %s: %v", paths.Meta, err)
 	}
 	defer st.Close()
+
+	// 过期会话启动时清一次：GetSession 会顺手删自己那条，
+	// 但「退出后再没回来过」的会话只能靠这里收尾。
+	if purgeErr := st.PurgeSessions(context.Background()); purgeErr != nil {
+		log.Printf("清理过期登录会话失败（不影响启动）: %v", purgeErr)
+	}
 
 	if *socketPath == "" && *addr == "" {
 		if env.InPlatform {

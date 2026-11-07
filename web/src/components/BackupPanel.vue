@@ -10,6 +10,7 @@ import BackupPolicyPanel from './BackupPolicyPanel.vue'
 import Modal from './Modal.vue'
 
 const props = defineProps<{ instanceId: string; instanceName: string; engine?: string }>()
+const isMongo = computed(() => props.engine === 'mongodb')
 const emit = defineEmits<{ changed: [] }>()
 
 // 备份永远是逻辑导出：容器里跑 mariadb-dump/mysqldump，实例保持运行
@@ -178,7 +179,11 @@ onMounted(async () => {
       </div>
       <p v-if="dbError" class="field-hint">读不到库列表：{{ dbError }}</p>
       <p class="field-hint">
-        只导出选中的那个库（逻辑导出，mariadb-dump / mysqldump），生成的是可直接导入的 .sql 文件，
+        {{
+          isMongo
+            ? '按数据库生成并校验 MongoDB 压缩归档，可用于同版本或兼容版本的 mongorestore。'
+            : '只导出选中的那个库（逻辑导出，MySQL 用 mysqldump、PostgreSQL 用 pg_dump），生成可直接导入的 .sql 文件。'
+        }}
         文件名带库名；导出期间实例保持运行，完成后做一次完整性校验。
       </p>
     </div>

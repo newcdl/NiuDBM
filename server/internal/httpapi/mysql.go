@@ -54,7 +54,7 @@ func (s *Server) mysqlSpec(in store.Instance) (mysqlctl.Spec, error) {
 //
 // 失败不清理现场：容器只停不删，日志写进实例目录（见 markDeployFailed），
 // 用户能在列表里看到这条失败记录、点开看日志、删掉重来。
-func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVersion string,
+func (s *Server) createService(ctx context.Context, engine, name, profile, seedSQL, wantVersion string,
 	opts createOpts, phase func(phase, text string)) (store.Instance, error) {
 	if phase == nil {
 		phase = func(string, string) {}
@@ -64,7 +64,7 @@ func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVe
 	s.createMySQLMu.Lock()
 	defer s.createMySQLMu.Unlock()
 
-	img, err := s.pickVersion(wantVersion)
+	img, err := s.pickVersionFor(engine, wantVersion)
 	if err != nil {
 		return store.Instance{}, errBadRequest(err.Error())
 	}
@@ -89,12 +89,13 @@ func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVe
 	in := store.Instance{
 		ID:            id,
 		Name:          name,
-		Engine:        mysqlctl.Engine,
+		Engine:        engine,
 		EngineVersion: img.Tag,
+		Image:         imageOrDefault(opts.Image, img.Name),
 		Mode:          "managed",
 		Status:        "creating",
-		// DataDir 记 "<id>/mysql"：instanceDir 取父目录，配置/密码/日志都在那里
-		DataDir:    id + "/mysql",
+		// DataDir 记 "<id>/<engine>"：instanceDir 取父目录，配置/密码/日志都在那里
+		DataDir:    id + "/" + engine,
 		Profile:    profile,
 		Port:       port,
 		Runtime:    runtimeDocker,
@@ -138,7 +139,7 @@ func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVe
 		return store.Instance{}, errInternal("写入台账失败")
 	}
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.markDeployFailed(ctx, in, "prepare", err.Error())
 		return in, errInternal(err.Error())
@@ -155,6 +156,10 @@ func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVe
 	plan, perr := s.planFor(in, img, rootPassword, password)
 	if perr != nil {
 		return fail("prepare", perr)
+	}
+	// 用户指定了镜像地址（私有仓库/加速站）就用它，其余参数（端口、数据目录、环境变量）不变
+	if opts.Image != "" {
+		plan.Image = opts.Image
 	}
 
 	phase("pull", "拉取镜像并启动容器（首次可能要几分钟）")
@@ -178,8 +183,6 @@ func (s *Server) createMySQL(ctx context.Context, name, profile, seedSQL, wantVe
 	if perr := spec.Provision(password, seedSQL); perr != nil {
 		return fail("provision", perr)
 	}
-
-	spec.Password = password
 
 	phase("finalize", "收尾：服务已就绪")
 	in.Status = "running"

@@ -29,11 +29,21 @@ type Instance struct {
 	Name          string `json:"name"`
 	Engine        string `json:"engine"`
 	EngineVersion string `json:"engineVersion"`
-	Mode          string `json:"mode"`
-	Status        string `json:"status"`
-	StatusReason  string `json:"statusReason,omitempty"`
-	DataDir       string `json:"dataDir"`
-	Profile       string `json:"profile"`
+	// Mode 区分本应用托管的容器服务与用户已有的外部数据库。
+	// 空值按 managed 处理，兼容旧台账。
+	Mode string `json:"mode"`
+	// Host / Username / TLSMode 只在外部连接模式使用。
+	Host     string `json:"host,omitempty"`
+	Username string `json:"username,omitempty"`
+	TLSMode  string `json:"tlsMode,omitempty"`
+	// Image 是实际拉取/运行的镜像地址（含加速站前缀或用户手填的私有仓库）。
+	// 与 EngineVersion 分开记：版本是给人看的（17 / 8.4），地址是给 Docker 用的，
+	// 国内网络下这两者经常不是同一个字符串（docker.m.daocloud.io/library/postgres:17）。
+	Image        string `json:"image,omitempty"`
+	Status       string `json:"status"`
+	StatusReason string `json:"statusReason,omitempty"`
+	DataDir      string `json:"dataDir"`
+	Profile      string `json:"profile"`
 	// Port 是服务占用的宿主端口
 	Port int `json:"port,omitempty"`
 	// Runtime 固定为 docker；保留字段是为了识别升级上来的老记录
@@ -129,6 +139,9 @@ func (s *Store) migrate() error {
 			engine TEXT NOT NULL,
 			engine_version TEXT NOT NULL DEFAULT '',
 			mode TEXT NOT NULL DEFAULT 'managed',
+			host TEXT NOT NULL DEFAULT '',
+			username TEXT NOT NULL DEFAULT '',
+			tls_mode TEXT NOT NULL DEFAULT 'disable',
 			status TEXT NOT NULL DEFAULT 'running',
 			status_reason TEXT NOT NULL DEFAULT '',
 			data_dir TEXT NOT NULL,
@@ -219,6 +232,42 @@ func (s *Store) migrate() error {
 			updated_at INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_policies_next ON backup_policies(enabled, next_run_at)`,
+		// 控制台登录会话：只存令牌哈希。落库而不是放内存，是为了应用重启/升级后
+		// 用户不必重新登录一次——升级时停服务是常态，掉登录态会让人以为是坏了。
+		`CREATE TABLE IF NOT EXISTS sessions (
+			token_hash TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			username TEXT NOT NULL DEFAULT '',
+			is_admin INTEGER NOT NULL DEFAULT 1,
+			user_agent TEXT NOT NULL DEFAULT '',
+			ip TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS instance_members (
+			instance_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			username TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL DEFAULT 'viewer',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (instance_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_members_user ON instance_members(user_id, instance_id)`,
+		`CREATE TABLE IF NOT EXISTS deploy_tasks (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			engine TEXT NOT NULL,
+			phase TEXT NOT NULL,
+			phase_text TEXT NOT NULL,
+			status TEXT NOT NULL,
+			error TEXT NOT NULL DEFAULT '',
+			instance_id TEXT NOT NULL DEFAULT '',
+			started_at INTEGER NOT NULL,
+			finished_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_deploy_tasks_started ON deploy_tasks(started_at DESC)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -243,6 +292,10 @@ func (s *Store) migrate() error {
 		{"mem_limit_mb", `ALTER TABLE instances ADD COLUMN mem_limit_mb INTEGER NOT NULL DEFAULT 0`},
 		{"storage_kind", `ALTER TABLE instances ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'volume'`},
 		{"storage_path", `ALTER TABLE instances ADD COLUMN storage_path TEXT NOT NULL DEFAULT ''`},
+		{"image", `ALTER TABLE instances ADD COLUMN image TEXT NOT NULL DEFAULT ''`},
+		{"host", `ALTER TABLE instances ADD COLUMN host TEXT NOT NULL DEFAULT ''`},
+		{"username", `ALTER TABLE instances ADD COLUMN username TEXT NOT NULL DEFAULT ''`},
+		{"tls_mode", `ALTER TABLE instances ADD COLUMN tls_mode TEXT NOT NULL DEFAULT 'disable'`},
 		{"bitmap_database", `ALTER TABLE backup_records ADD COLUMN database_name TEXT NOT NULL DEFAULT ''`},
 	} {
 		if _, err := s.db.ExecContext(ctx, alter.stmt); err != nil &&
@@ -271,6 +324,20 @@ func runtimeOf(runtime string) string {
 	return runtime
 }
 
+func modeOf(mode string) string {
+	if mode == "" {
+		return "managed"
+	}
+	return mode
+}
+
+func tlsModeOf(mode string) string {
+	if mode == "require" {
+		return "require"
+	}
+	return "disable"
+}
+
 // storageKindOf 把空值收敛成 volume：老实例的数据都在命名卷里。
 func storageKindOf(kind string) string {
 	if kind == "" {
@@ -280,15 +347,20 @@ func storageKindOf(kind string) string {
 }
 
 // instanceColumns 是 instances 表的读取列顺序，避免三处 SELECT 各写一份走样。
-const instanceColumns = `id, name, engine, engine_version, mode, status, status_reason, data_dir, profile, port, runtime,
+const instanceColumns = `id, name, engine, engine_version, mode, host, username, tls_mode,
+	image, status, status_reason, data_dir, profile, port, runtime,
 	cpu_limit, mem_limit_mb, storage_kind, storage_path, created_at, updated_at`
 
 // scanInstance 按 instanceColumns 的顺序扫一行。
 func scanInstance(sc interface{ Scan(...any) error }) (Instance, error) {
 	var in Instance
-	err := sc.Scan(&in.ID, &in.Name, &in.Engine, &in.EngineVersion, &in.Mode, &in.Status,
-		&in.StatusReason, &in.DataDir, &in.Profile, &in.Port, &in.Runtime,
+	err := sc.Scan(&in.ID, &in.Name, &in.Engine, &in.EngineVersion, &in.Mode, &in.Host, &in.Username,
+		&in.TLSMode, &in.Image, &in.Status, &in.StatusReason, &in.DataDir, &in.Profile, &in.Port, &in.Runtime,
 		&in.CPULimit, &in.MemLimitMB, &in.StorageKind, &in.StoragePath, &in.CreatedAt, &in.UpdatedAt)
+	if err == nil {
+		in.Mode = modeOf(in.Mode)
+		in.TLSMode = tlsModeOf(in.TLSMode)
+	}
 	return in, err
 }
 
@@ -302,10 +374,12 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 		in.UpdatedAt = now
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO instances
-		(id, name, engine, engine_version, mode, status, status_reason, data_dir, profile, port, runtime,
+		(id, name, engine, engine_version, mode, host, username, tls_mode,
+		 image, status, status_reason, data_dir, profile, port, runtime,
 		 cpu_limit, mem_limit_mb, storage_kind, storage_path, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		in.ID, in.Name, in.Engine, in.EngineVersion, in.Mode, in.Status, in.StatusReason,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		in.ID, in.Name, in.Engine, in.EngineVersion, modeOf(in.Mode), in.Host, in.Username, tlsModeOf(in.TLSMode),
+		in.Image, in.Status, in.StatusReason,
 		in.DataDir, in.Profile, in.Port, runtimeOf(in.Runtime),
 		in.CPULimit, in.MemLimitMB, storageKindOf(in.StorageKind), in.StoragePath,
 		in.CreatedAt, in.UpdatedAt)
@@ -318,14 +392,16 @@ func (s *Store) CreateInstance(ctx context.Context, in Instance) error {
 // ListInstances 返回未删除的实例；q 对名称做模糊匹配。
 // HideLegacy 把不再支持的实例从界面收起来。
 //
-// 这一版本只认 MySQL + Docker：老库里的 SQLite、PostgreSQL 和本机进程 MySQL
-// 在新模型下既启动不了也解释不清，留在列表里只会让用户以为"坏了"。
+// 当前只认 MySQL / PostgreSQL / MongoDB 的 Docker 托管服务与外部连接；
+// 开发期间遗留的其它实例从界面收起，避免用户误以为服务损坏。
 // 只软删除台账记录，数据目录与容器一律不动——用户可能还要自己导出。
 func (s *Store) HideLegacy(ctx context.Context) (int64, error) {
 	now := time.Now().UnixMilli()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE instances SET deleted_at = ?, updated_at = ?
-		 WHERE deleted_at IS NULL AND (engine <> 'mysql' OR runtime <> 'docker')`,
+		 WHERE deleted_at IS NULL
+		   AND (engine NOT IN ('mysql', 'postgres', 'mongodb')
+		        OR (mode <> 'external' AND runtime <> 'docker'))`,
 		now, now)
 	if err != nil {
 		return 0, err

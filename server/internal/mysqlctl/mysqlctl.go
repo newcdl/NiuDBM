@@ -46,6 +46,12 @@ type Spec struct {
 	// 配置项可用范围与老版本账号语法都按这两者判断。
 	Series string
 	Flavor string
+	// Host / User / External / TLSMode 用于用户已有 MySQL 的直连管理。
+	// 托管容器不填这些字段，仍走 127.0.0.1 与 niudbm 管理账号。
+	Host     string
+	User     string
+	External bool
+	TLSMode  string
 	// DataDir 是宿主侧数据目录：命名卷时只用于展示体积，bind 时是真实目录。
 	DataDir string
 	// ConfDir 是宿主侧的 conf.d 目录，挂进容器后改参数重启即生效。
@@ -66,6 +72,20 @@ type DockerRuntime struct {
 }
 
 func (s Spec) dockerMode() bool { return s.Docker != nil && s.Docker.Client != nil }
+
+func (s Spec) host() string {
+	if strings.TrimSpace(s.Host) != "" {
+		return strings.TrimSpace(s.Host)
+	}
+	return "127.0.0.1"
+}
+
+func (s Spec) adminUser() string {
+	if strings.TrimSpace(s.User) != "" {
+		return strings.TrimSpace(s.User)
+	}
+	return SuperUser
+}
 
 // Container 返回容器名。
 func (s Spec) Container() string {
@@ -90,6 +110,9 @@ func DirSize(root string) int64 {
 
 // Running 判断容器是否在跑。
 func (s Spec) Running() bool {
+	if s.External {
+		return s.checkConnection() == nil
+	}
 	if !s.dockerMode() {
 		return false
 	}
@@ -146,22 +169,4 @@ func (s Spec) waitReady(timeout time.Duration) error {
 		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("%s 内实例没就绪，请看容器日志：docker logs %s", timeout, s.Container())
-}
-
-// tailText 把命令输出裁成一段可读的错误详情。
-func tailText(out []byte, err error) string {
-	text := strings.TrimSpace(string(out))
-	if len(text) > 600 {
-		text = "…" + text[len(text)-600:]
-	}
-	if text == "" {
-		if err != nil {
-			return err.Error()
-		}
-		return "未知错误"
-	}
-	if err != nil {
-		return text + "（" + err.Error() + "）"
-	}
-	return text
 }

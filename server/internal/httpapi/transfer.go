@@ -42,12 +42,12 @@ func (s *Server) pickDatabase(r *http.Request, in store.Instance, want string) (
 		name = strings.TrimSpace(r.URL.Query().Get("database"))
 	}
 	if name != "" {
-		if err := mysqlctl.ValidDBName(name); err != nil {
+		if err := validDBName(in, name); err != nil {
 			return "", err
 		}
 		return name, nil
 	}
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		return "", err
 	}
@@ -76,6 +76,10 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("MongoDB 暂不提供 SQL / CSV 导入导出"))
+		return
+	}
 
 	dbName, derr := s.pickDatabase(r, in, "")
 	if derr != nil {
@@ -100,7 +104,7 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 
 // tableNames 取实例里的表名，同时用作导入导出的目标校验。
 func (s *Server) tableNames(in store.Instance, dbName string) ([]string, error) {
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +123,10 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("MongoDB 暂不提供 CSV 导出"))
 		return
 	}
 	table := strings.TrimSpace(r.URL.Query().Get("table"))
@@ -163,7 +171,7 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 
 	// 再把执行器准备好，两处错误都能正常返回 JSON
 	var export func(io.Writer) (int64, error)
-	spec, serr := s.mysqlSpec(in)
+	spec, serr := s.dbSpec(in)
 	if serr != nil {
 		s.fail(w, r, errBadRequest(serr.Error()))
 		return
@@ -194,6 +202,10 @@ func (s *Server) handleImportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("MongoDB 暂不提供 CSV 导入"))
 		return
 	}
 
@@ -231,7 +243,7 @@ func (s *Server) handleImportCSV(w http.ResponseWriter, r *http.Request) {
 		n   int64
 		err error
 	)
-	spec, serr := s.mysqlSpec(in)
+	spec, serr := s.dbSpec(in)
 	if serr != nil {
 		s.fail(w, r, errBadRequest(serr.Error()))
 		return
@@ -265,6 +277,10 @@ func (s *Server) handleImportSQL(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("MongoDB 暂不提供 SQL 导入"))
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxImportBytes)
 	raw, err := io.ReadAll(r.Body)
@@ -296,7 +312,7 @@ func (s *Server) handleImportSQL(w http.ResponseWriter, r *http.Request) {
 		executed int
 		execErr  error
 	)
-	spec, serr := s.mysqlSpec(in)
+	spec, serr := s.dbSpec(in)
 	if serr != nil {
 		s.fail(w, r, errBadRequest(serr.Error()))
 		return

@@ -1,25 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, type ImageList, type ImageInfo } from '../api'
+import { api, engineLabel, type ImageList, type ImageInfo } from '../api'
 import { errText } from '../format'
 import EngineTabs from '../components/EngineTabs.vue'
-import type { Engine } from '../components/EngineTabs.vue'
+import type { Engine } from '../engine'
 
 const engine = ref<Engine>('mysql')
-
-const WIP: Record<Exclude<Engine, 'mysql'>, { title: string; intro: string; plans: string[] }> = {
-  postgresql: {
-    title: 'PostgreSQL 还在做',
-    intro: '这套控制台是按 MySQL 打通的，PostgreSQL 会复用同一套部署、备份、导入导出和账号管理流程，只是底层的客户端与 SQL 语句不同。',
-    plans: ['部署与版本管理（含 ARM 架构的官方镜像）', '库表浏览与 SQL 查询', '账号、访问来源与库级授权', '逻辑备份恢复与 CSV 导入导出'],
-  },
-  mongodb: {
-    title: 'MongoDB 还在做',
-    intro: 'MongoDB 不是关系型数据库，账号、备份、导入导出都会单独做一套，不会硬套 MySQL 的模型。',
-    plans: ['单机与副本集部署', '集合浏览与文档查询', '基于角色的用户管理', 'mongodump / mongorestore 备份恢复'],
-  },
-}
 
 const list = ref<ImageList | null>(null)
 const loading = ref(false)
@@ -31,22 +18,36 @@ const timers: Record<string, number> = {}
 
 const items = computed<ImageInfo[]>(() => list.value?.items ?? [])
 
-// 按系列分组：MySQL 与 MariaDB 的版本语义不同，混在一张表里最容易被误选
+// 引擎页签各管各的：MySQL 页签下是 MySQL + MariaDB（同一套协议，
+// 但版本语义不同所以要分两段），PostgreSQL 页签下只有 PG。
+// 三个引擎的版本号会撞（都叫 16），混在一页里最容易被误选。
+const FAMILIES_OF_TAB: Record<Engine, string[]> = {
+  mysql: ['mysql', 'mariadb'],
+  postgresql: ['postgres'],
+  mongodb: ['mongodb'],
+}
+
+const visible = computed(() =>
+  items.value.filter((i) => FAMILIES_OF_TAB[engine.value].includes(i.family)),
+)
+
 const groups = computed(() => {
   const order: { family: string; title: string }[] = [
     { family: 'mysql', title: 'MySQL' },
     { family: 'mariadb', title: 'MariaDB' },
+    { family: 'postgres', title: 'PostgreSQL' },
+    { family: 'mongodb', title: 'MongoDB' },
   ]
   return order
     .map((g) => {
-      const list = items.value.filter((i) => i.family === g.family)
+      const list = visible.value.filter((i) => i.family === g.family)
       return { ...g, items: list, ready: list.filter((i) => i.local).length }
     })
     .filter((g) => g.items.length)
 })
 
 const stats = computed(() => {
-  const all = items.value
+  const all = visible.value
   const inUse = new Set<string>()
   all.forEach((i) => (i.usedBy ?? []).forEach((n) => inUse.add(n)))
   return {
@@ -115,7 +116,7 @@ function poll(tag: string, jobId: string): void {
 async function pull(img: ImageInfo): Promise<void> {
   if (pulling.value[img.tag]) return
   try {
-    const res = await api.pullImage(img.tag)
+    const res = await api.pullImage(img.tag, img.family)
     if (res.cached) {
       ElMessage.success('本地已有这个镜像')
       await load()
@@ -143,7 +144,7 @@ async function remove(img: ImageInfo): Promise<void> {
     return
   }
   try {
-    const res = await api.deleteImage(img.tag)
+    const res = await api.deleteImage(img.tag, img.family)
     ElMessage.success(res.message)
     await load()
   } catch (e) {
@@ -165,7 +166,7 @@ function usedText(img: ImageInfo): string {
       <div>
         <h2>镜像</h2>
         <p class="muted">
-          服务跑在官方镜像里，版本就是镜像 tag。可以现在就拉好，部署时不用再等；
+          {{ engineLabel(engine) }} 的版本就是镜像 tag，一个 tag 一个版本。可以现在就拉好，部署时不用再等；
           删掉镜像只是省磁盘，服务与数据都不动。
         </p>
       </div>
@@ -186,20 +187,7 @@ function usedText(img: ImageInfo): string {
       <button type="button" class="btn btn-sm" @click="load">重试</button>
     </div>
 
-    <section v-if="engine !== 'mysql'" class="wip-panel">
-      <div class="wip-head">
-        <h3>{{ WIP[engine].title }}</h3>
-        <span class="pill pill-warn">开发中</span>
-      </div>
-      <p class="muted">{{ WIP[engine].intro }}</p>
-      <ul class="wip-list">
-        <li v-for="p in WIP[engine].plans" :key="p">{{ p }}</li>
-      </ul>
-      <p class="muted small">现在先用 MySQL：部署、备份、导入导出、账号管理都是通的。</p>
-    </section>
-
-    <template v-else>
-      <div v-if="!dockerOk" class="notice notice-bad">
+    <div v-if="!dockerOk" class="notice notice-bad">
         <span>读不到 Docker。请确认服务已加入 docker 用户组、且 /var/run/docker.sock 可访问；修好之前无法部署服务。</span>
       </div>
 
@@ -221,6 +209,14 @@ function usedText(img: ImageInfo): string {
           <span>当前架构</span>
         </div>
       </section>
+
+      <p v-if="!loading && stats.total" class="catalog-note">
+        已加载 {{ stats.total }} 个可选版本，本机已有 {{ stats.local }} 个；未拉取的版本仍会出现在下方，可点「立即拉取」。
+      </p>
+
+      <p v-if="!loading && !groups.length" class="muted">
+        这个引擎暂时没有可部署的版本。换到 MySQL / PostgreSQL / MongoDB 页签看看，或点右上角「刷新」。
+      </p>
 
       <section v-for="g in groups" :key="g.family" class="group">
         <header class="group-head">
@@ -291,8 +287,7 @@ function usedText(img: ImageInfo): string {
       <p class="muted small foot">
         当前架构 {{ stats.arch }}；<code>amd64</code> 指 Intel/AMD 的 NAS，<code>arm64</code> 指 ARM 的 NAS。
         离线机器可以先在别处 <code>docker save</code>，再 <code>docker load</code> 到这台机器。
-      </p>
-    </template>
+    </p>
   </div>
 </template>
 
@@ -320,35 +315,6 @@ function usedText(img: ImageInfo): string {
   max-width: 720px;
   font-size: 13.5px;
   line-height: 1.6;
-}
-
-.wip-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 20px 22px;
-  border: 1px dashed var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-}
-
-.wip-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.wip-head h3 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.wip-list {
-  margin: 0;
-  padding-left: 20px;
-  color: var(--fg-muted);
-  font-size: 13.5px;
-  line-height: 1.9;
 }
 
 /* ---------- 统计条 ---------- */
@@ -483,6 +449,12 @@ function usedText(img: ImageInfo): string {
 .foot {
   margin: 0;
   line-height: 1.7;
+}
+
+.catalog-note {
+  margin: -4px 2px 0;
+  color: var(--fg-muted);
+  font-size: 12.5px;
 }
 
 @media (max-width: 900px) {

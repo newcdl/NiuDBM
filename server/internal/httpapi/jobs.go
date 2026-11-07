@@ -109,6 +109,27 @@ func (s *Server) setJobProgress(jobID string, pct int) {
 	_ = s.st.SetJobProgress(context.Background(), jobID, pct)
 }
 
+func (s *Server) registerJobCancel(jobID string, cancel context.CancelFunc) {
+	if jobID == "" || cancel == nil {
+		return
+	}
+	s.jobCancels.Store(jobID, cancel)
+}
+
+func (s *Server) unregisterJobCancel(jobID string) {
+	if jobID != "" {
+		s.jobCancels.Delete(jobID)
+	}
+}
+
+func (s *Server) cancelJobExecution(jobID string) {
+	if v, ok := s.jobCancels.Load(jobID); ok {
+		if cancel, ok := v.(context.CancelFunc); ok {
+			cancel()
+		}
+	}
+}
+
 // errorCodeString 把接口错误里的业务码转成字符串，便于任务中心展示。
 func errorCodeString(err error) string {
 	var ae apiErr
@@ -119,7 +140,8 @@ func errorCodeString(err error) string {
 }
 
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, false); !ok {
+	id, ok := s.require(w, r, false)
+	if !ok {
 		return
 	}
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
@@ -130,15 +152,34 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errInternal("读取任务失败"))
 		return
 	}
-	active, err := s.st.ActiveJobCount(r.Context())
-	if err != nil {
-		active = 0
+	active := 0
+	if id.IsAdmin {
+		if n, aerr := s.st.ActiveJobCount(r.Context()); aerr == nil {
+			active = n
+		}
+	} else {
+		roles, rerr := s.st.InstanceIDsForMember(r.Context(), id.UserID)
+		if rerr != nil {
+			s.fail(w, r, errInternal("读取服务权限失败"))
+			return
+		}
+		filtered := items[:0]
+		for _, job := range items {
+			if _, allowed := roles[job.TargetID]; allowed {
+				filtered = append(filtered, job)
+				if job.Status == store.JobQueued || job.Status == store.JobRunning {
+					active++
+				}
+			}
+		}
+		items = filtered
 	}
 	writeOK(w, r, map[string]any{"items": items, "total": len(items), "active": active})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, false); !ok {
+	id, ok := s.require(w, r, false)
+	if !ok {
 		return
 	}
 	job, err := s.st.GetJob(r.Context(), r.PathValue("id"))
@@ -150,6 +191,13 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errInternal("读取任务失败"))
 		return
 	}
+	if !id.IsAdmin {
+		role, rerr := s.st.InstanceMemberRole(r.Context(), job.TargetID, id.UserID)
+		if rerr != nil || roleRank(role) < roleRank(store.MemberRoleViewer) {
+			s.fail(w, r, errNotFound("任务不存在"))
+			return
+		}
+	}
 	writeOK(w, r, job)
 }
 
@@ -158,7 +206,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // 引擎下载/导入是唯一真正能"立刻停下"的操作（有上下文）；同步操作在写入任务时
 // 已经是终态，走到这里会得到 409，前端据此提示"任务已结束"。
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.require(w, r, true)
+	id, ok := s.require(w, r, false)
 	if !ok {
 		return
 	}
@@ -176,10 +224,26 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errState("该任务已结束，不能取消"))
 		return
 	}
+	if !id.IsAdmin {
+		role, rerr := s.st.InstanceMemberRole(r.Context(), job.TargetID, id.UserID)
+		if rerr != nil || roleRank(role) < roleRank(store.MemberRoleOperator) {
+			s.fail(w, r, apiErr{http.StatusForbidden, codeForbidden, "没有取消该服务任务的权限"})
+			return
+		}
+	}
 
 	// 顺序很重要：先在台账里落"已取消"，再撤执行上下文。反过来的话，
 	// 执行侧的收尾回调会抢先把状态写成 failed，用户看到的是"取消失败"。
-	canceled, _ := s.st.CancelJob(r.Context(), jobID)
+	canceled, cancelErr := s.st.CancelJob(r.Context(), jobID)
+	if cancelErr != nil {
+		if errors.Is(cancelErr, store.ErrJobFinished) {
+			s.fail(w, r, errState("该任务已结束，不能取消"))
+		} else {
+			s.fail(w, r, errInternal("取消任务失败"))
+		}
+		return
+	}
+	s.cancelJobExecution(jobID)
 
 	s.audit(r, id, "job.cancel", "job", jobID, "ok", job.Type+" "+job.TargetID)
 	writeOK(w, r, map[string]any{"id": canceled.ID, "status": canceled.Status})

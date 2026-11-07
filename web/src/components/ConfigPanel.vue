@@ -7,7 +7,7 @@ import { errText } from '../format'
 const props = defineProps<{ instanceId: string; engine: string }>()
 const emit = defineEmits<{ changed: [] }>()
 
-// 配置项由后端给出：PG 读 pg_settings，SQLite 是 PRAGMA，两边能调的东西完全不同，
+// 配置项由后端给出：PostgreSQL 读 pg_settings，MySQL/MariaDB 读变量，
 // 前端不预设清单，只负责按 kind 渲染控件、按 apply 说明生效方式。
 const items = ref<ConfigItem[]>([])
 const original = ref<Record<string, string>>({})
@@ -31,10 +31,8 @@ const statusLoading = ref(false)
 const statusError = ref('')
 
 const APPLY_TEXT: Record<string, string> = {
-  persistent: '写入库文件，立即生效',
   reload: '保存后立即生效',
   restart: '需重启实例才生效',
-  session: '下一次操作时生效',
 }
 
 const BOOL_OPTIONS = ['on', 'off']
@@ -225,8 +223,7 @@ onMounted(() => {
         </div>
         <p class="tip">
           <template v-if="engine === 'postgres'">PostgreSQL 参数写入实例配置，标记为需重启的项目要停止再启动实例。</template>
-          <template v-else-if="engine === 'mysql'">MySQL 参数写入实例的 my.cnf，标记为需重启的项目要停止再启动实例。</template>
-          <template v-else>SQLite 的连接类 PRAGMA 仅用于本应用建立的连接，外部应用需要自行设置。</template>
+          <template v-else>MySQL 参数写入实例的 my.cnf，标记为需重启的项目要停止再启动实例。</template>
           修改前请确认内存与持久化风险，未保存不会写入。
         </p>
 

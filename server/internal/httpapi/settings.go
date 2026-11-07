@@ -261,7 +261,7 @@ func (s *Server) handleTestNotify(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errBadRequest("测试通知发送失败："+err.Error()))
 		return
 	}
-	s.audit(r, id, "settings.notify_test", "settings", settingsKey, "ok", cfg.NotifyWebhook)
+	s.audit(r, id, "settings.notify_test", "settings", settingsKey, "ok", "测试通知发送成功")
 	writeOK(w, r, map[string]any{"ok": true, "message": "测试通知已发送，请到接收端确认。"})
 }
 

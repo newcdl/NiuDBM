@@ -121,6 +121,8 @@ func portEngineName(port int) string {
 	switch port {
 	case 3306, 3307:
 		return "MySQL/MariaDB 默认端口"
+	case 5432:
+		return "PostgreSQL 默认端口"
 	case 6379:
 		return "Redis 默认端口"
 	case 27017:

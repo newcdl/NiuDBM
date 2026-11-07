@@ -97,7 +97,7 @@ func TestDeployLogWithoutFailure(t *testing.T) {
 		Status:        "running",
 		DataDir:       "01OKTEST000000000000000000/mysql",
 		Profile:       "standard",
-		Runtime:       "native",
+		Runtime:       runtimeDocker,
 		StorageKind:   "volume",
 	}
 	if err := e.st.CreateInstance(ctx, in); err != nil {

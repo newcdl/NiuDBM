@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"niudbm/server/internal/mysqlctl"
+	"niudbm/server/internal/pgctl"
 )
 
 // configReq 是配置页提交的内容：只传改动过的键，其它键保持原值。
@@ -24,8 +25,12 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库的配置文件不在本机，暂不支持在线修改"))
+		return
+	}
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -56,6 +61,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库的配置文件不在本机，暂不支持在线修改"))
+		return
+	}
 
 	var req configReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -73,7 +82,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	detail := describeChanges(req.Values)
 
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
@@ -108,10 +117,20 @@ func (s *Server) handleConfigPresets(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, false); !ok {
 		return
 	}
-	if _, ok := s.load(w, r); !ok {
+	in, ok := s.load(w, r)
+	if !ok {
 		return
 	}
-	writeOK(w, r, map[string]any{"items": mysqlctl.TuningPresets()})
+	if isExternal(in) || in.Engine == engineMongoDB {
+		s.fail(w, r, errBadRequest("外部数据库暂不提供参数档位"))
+		return
+	}
+	// 档位是"按内存算参数"，两套参数名完全不同，不能混着给
+	items := mysqlctl.TuningPresets()
+	if in.Engine == enginePostgres {
+		items = pgctl.Presets()
+	}
+	writeOK(w, r, map[string]any{"items": items})
 }
 
 // handleInstanceStatus 返回运行状态指标（SHOW GLOBAL STATUS 里最常用的那些）。
@@ -123,7 +142,7 @@ func (s *Server) handleInstanceStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return

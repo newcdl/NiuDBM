@@ -2,8 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -40,6 +44,9 @@ func (s *Server) instanceDir(in store.Instance) string {
 // 这样"删除服务并清除数据"能一并清掉，用户也找得到文件。
 // 命名卷方式：数据由 docker 管，这里返回空串，由 storageLabel 给出可读位置。
 func (s *Server) storageDir(in store.Instance) string {
+	if isExternal(in) {
+		return ""
+	}
 	if in.StorageKind == storageVolume {
 		return ""
 	}
@@ -51,6 +58,9 @@ func (s *Server) storageDir(in store.Instance) string {
 
 // storageLabel 是给用户看的数据位置：目录路径，或命名卷的名字。
 func (s *Server) storageLabel(in store.Instance) string {
+	if isExternal(in) {
+		return in.Host
+	}
 	if in.StorageKind == storageVolume {
 		return "docker 卷 " + volumeName(in.ID)
 	}
@@ -70,6 +80,12 @@ func (s *Server) rootSecretPath(id string) string {
 	return filepath.Join(s.paths.Instances, id, "root-secret")
 }
 
+// externalSecretPath 保存外部数据库的管理密码。
+// 外部连接没有实例数据目录，凭据放在 etc/secrets 下，不进入共享备份目录。
+func (s *Server) externalSecretPath(id string) string {
+	return filepath.Join(s.paths.Secrets, id+".secret")
+}
+
 // writeSecret 保存管理账号（niudbm）密码。
 func (s *Server) writeSecret(id, password string) error {
 	return writeSecretFile(s.secretPath(id), password)
@@ -85,6 +101,73 @@ func (s *Server) readSecret(id string) string { return readSecretFile(s.secretPa
 
 // readRootSecret 读 root 密码。
 func (s *Server) readRootSecret(id string) string { return readSecretFile(s.rootSecretPath(id)) }
+
+func (s *Server) writeExternalSecret(id, password string) error {
+	key, err := s.externalEncryptionKey()
+	if err != nil {
+		return err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return err
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(password), nil)
+	return writeSecretFile(s.externalSecretPath(id), "v1:"+base64.RawStdEncoding.EncodeToString(sealed))
+}
+
+func (s *Server) readExternalSecret(id string) string {
+	raw := readSecretFile(s.externalSecretPath(id))
+	if !strings.HasPrefix(raw, "v1:") {
+		return raw
+	}
+	key, err := s.externalEncryptionKey()
+	if err != nil {
+		return ""
+	}
+	data, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(raw, "v1:"))
+	if err != nil {
+		return ""
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return ""
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(data) < gcm.NonceSize() {
+		return ""
+	}
+	plain, err := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], nil)
+	if err != nil {
+		return ""
+	}
+	return string(plain)
+}
+
+func (s *Server) externalEncryptionKey() ([]byte, error) {
+	path := filepath.Join(s.paths.Secrets, "external.key")
+	if raw, err := os.ReadFile(path); err == nil && len(raw) == 32 {
+		return raw, nil
+	}
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, key, 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
 
 // userSecretPath 是业务账号密码的存放位置：密码只在创建/修改时拿到一次，
 // 但用户过两天要配客户端时还得能查回来，所以留一份在本机（0600，仅本机可读）。

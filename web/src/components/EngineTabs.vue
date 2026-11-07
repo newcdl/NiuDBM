@@ -1,17 +1,14 @@
 <script setup lang="ts">
-/**
- * 引擎页签。目前只有 MySQL 可用，PostgreSQL 与 MongoDB 先占位，
- * 让"以后会支持什么"在界面上有明确的落点，而不是等做完再突然多出来。
- */
-export type Engine = 'mysql' | 'postgresql' | 'mongodb'
+/** 引擎页签。MongoDB 适配完成前不展示入口，避免用户点进空页面。 */
+import type { Engine } from '../engine'
 
 const props = defineProps<{ modelValue: Engine }>()
 const emit = defineEmits<{ 'update:modelValue': [Engine] }>()
 
 const ENGINES: { key: Engine; label: string; ready: boolean }[] = [
   { key: 'mysql', label: 'MySQL', ready: true },
-  { key: 'postgresql', label: 'PostgreSQL', ready: false },
-  { key: 'mongodb', label: 'MongoDB', ready: false },
+  { key: 'postgresql', label: 'PostgreSQL', ready: true },
+  { key: 'mongodb', label: 'MongoDB', ready: true },
 ]
 
 function pick(key: Engine): void {
@@ -31,7 +28,6 @@ function pick(key: Engine): void {
       @click="pick(e.key)"
     >
       {{ e.label }}
-      <span v-if="!e.ready" class="wip">开发中</span>
     </button>
   </nav>
 </template>
@@ -63,15 +59,6 @@ function pick(key: Engine): void {
   background: var(--bg);
   color: var(--fg);
   box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
-}
-
-.wip {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: rgb(240 180 60 / 18%);
-  color: #a86b00;
-  font-size: 11px;
-  font-style: normal;
 }
 
 @media (max-width: 720px) {

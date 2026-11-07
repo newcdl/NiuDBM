@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"niudbm/server/internal/images"
+	"niudbm/server/internal/store"
 )
 
 // overviewImage 是概览页的镜像块：这个版本本地有没有、当前架构能不能跑。
@@ -101,7 +102,8 @@ type overviewDocker struct {
 // 数据量都很小（实例几十个、备份上千条），所以直接用现成的查询在内存里聚合，
 // 不额外维护统计表——那种表一旦和真相不一致，排查成本远高于这点查询开销。
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, false); !ok {
+	id, ok := s.require(w, r, false)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
@@ -112,9 +114,19 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errInternal("读取实例失败"))
 		return
 	}
+	list, roles, err := s.visibleInstances(ctx, id, list)
+	if err != nil {
+		s.fail(w, r, errInternal("读取服务权限失败"))
+		return
+	}
+	memberIDs := make([]string, 0, len(roles))
+	for instanceID := range roles {
+		memberIDs = append(memberIDs, instanceID)
+	}
 	items := make([]instanceView, 0, len(list))
 	for _, in := range list {
 		v := s.view(in)
+		s.applyAccess(r, id, &v)
 		out.Instances.Total++
 		// 用容器真实状态计数：台账里可能还是 running，但容器早就退出了
 		switch v.Status {
@@ -163,12 +175,26 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		out.Images = append(out.Images, item)
 	}
 
-	if stat, err := s.st.BackupStats(ctx, 0); err == nil {
+	var statErr error
+	var stat store.BackupStat
+	if id.IsAdmin {
+		stat, statErr = s.st.BackupStats(ctx, 0)
+	} else {
+		stat, statErr = s.st.BackupStatsForInstances(ctx, memberIDs, 0)
+	}
+	if statErr == nil {
 		out.Backups.Total = stat.Total
 		out.Backups.Failed = stat.Failed
 		out.Backups.LatestAt = stat.LatestAt
 	}
-	if recent, err := s.st.ListRecentBackups(ctx, 5); err == nil {
+	var recent []store.BackupWithInstance
+	var recentErr error
+	if id.IsAdmin {
+		recent, recentErr = s.st.ListRecentBackups(ctx, 5)
+	} else {
+		recent, recentErr = s.st.ListRecentBackupsForInstances(ctx, memberIDs, 5)
+	}
+	if recentErr == nil {
 		for _, b := range recent {
 			out.Backups.Recent = append(out.Backups.Recent, overviewBackupItem{
 				ID: b.ID, InstanceID: b.InstanceID, InstanceName: b.InstanceName,
@@ -178,14 +204,34 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if active, err := s.st.ActiveJobCount(ctx); err == nil {
-		out.Jobs.Active = active
-	}
-	if failed, err := s.st.CountJobsSince(ctx, time.Now().Add(-24*time.Hour).UnixMilli(), "failed"); err == nil {
-		out.Jobs.Failed24h = failed
+	if id.IsAdmin {
+		if active, err := s.st.ActiveJobCount(ctx); err == nil {
+			out.Jobs.Active = active
+		}
+		if failed, err := s.st.CountJobsSince(ctx, time.Now().Add(-24*time.Hour).UnixMilli(), "failed"); err == nil {
+			out.Jobs.Failed24h = failed
+		}
+	} else if allJobs, err := s.st.ListJobs(ctx, "", 500); err == nil {
+		since := time.Now().Add(-24 * time.Hour).UnixMilli()
+		for _, j := range allJobs {
+			if _, allowed := roles[j.TargetID]; !allowed {
+				continue
+			}
+			if j.Status == store.JobQueued || j.Status == store.JobRunning {
+				out.Jobs.Active++
+			}
+			if j.Status == store.JobFailed && j.CreatedAt >= since {
+				out.Jobs.Failed24h++
+			}
+		}
 	}
 	if jobs, err := s.st.ListJobs(ctx, "", 5); err == nil {
 		for _, j := range jobs {
+			if !id.IsAdmin {
+				if _, allowed := roles[j.TargetID]; !allowed {
+					continue
+				}
+			}
 			out.Jobs.Recent = append(out.Jobs.Recent, jobB{
 				ID: j.ID, Type: j.Type, Status: j.Status, TargetID: j.TargetID, CreatedAt: j.CreatedAt,
 			})
@@ -194,10 +240,22 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	if n, err := s.st.CountAuditSince(ctx, startOfDay.UnixMilli()); err == nil {
+	if n, err := func() (int, error) {
+		if id.IsAdmin {
+			return s.st.CountAuditSince(ctx, startOfDay.UnixMilli())
+		}
+		return s.st.CountAuditSinceForInstances(ctx, startOfDay.UnixMilli(), memberIDs)
+	}(); err == nil {
 		out.Audit.Today = n
 	}
-	if logs, err := s.st.ListAudit(ctx, 5); err == nil {
+	var logs []store.Audit
+	var logsErr error
+	if id.IsAdmin {
+		logs, logsErr = s.st.ListAudit(ctx, 5)
+	} else {
+		logs, logsErr = s.st.ListRecentAuditForInstances(ctx, memberIDs, 5)
+	}
+	if logsErr == nil {
 		for _, l := range logs {
 			out.Audit.Recent = append(out.Audit.Recent, auditBrief{
 				ID: l.ID, Ts: l.Ts, Username: l.Username, Action: l.Action,

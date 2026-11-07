@@ -26,6 +26,12 @@ type Image struct {
 const (
 	FamilyMySQL   = "mysql"
 	FamilyMariaDB = "mariadb"
+	// FamilyPostgres 是 PostgreSQL 官方镜像的 family。
+	// 与 MySQL 系的差别在初始化变量（POSTGRES_PASSWORD）、客户端工具（psql/pg_dump）
+	// 和权限模型（库级 CONNECT + schema 级授权），相关分支集中在 pgctl。
+	FamilyPostgres = "postgres"
+	// FamilyMongo 使用官方 MongoDB 镜像与 mongodump/mongorestore。
+	FamilyMongo = "mongodb"
 )
 
 // 版本来源：MySQL 官方 2026-10 发布的 26.10.0 / 9.7.4 / 8.4.13 与 8.0 维护线。
@@ -72,6 +78,35 @@ var catalog = []Image{
 		Tag: "10.11", Name: "mariadb:10.11", Family: FamilyMariaDB, Label: "MariaDB 10.11 LTS",
 		Archs: []string{"amd64", "arm64"},
 	},
+	{
+		Tag: "17", Name: "postgres:17", Family: FamilyPostgres, Label: "PostgreSQL 17", Default: true,
+		Archs: []string{"amd64", "arm64"},
+		Note:  "当前稳定大版本，生产优先选它",
+	},
+	{
+		Tag: "16", Name: "postgres:16", Family: FamilyPostgres, Label: "PostgreSQL 16",
+		Archs: []string{"amd64", "arm64"},
+		Note:  "上一代稳定版本，扩展生态兼容性最好",
+	},
+	{
+		Tag: "15", Name: "postgres:15", Family: FamilyPostgres, Label: "PostgreSQL 15（老项目兼容）",
+		Archs: []string{"amd64", "arm64"},
+		Note:  "老项目仍在用；新项目建议 16 或 17",
+	},
+	{
+		Tag: "8.0", Name: "mongo:8.0", Family: FamilyMongo, Label: "MongoDB 8.0", Default: true,
+		Archs: []string{"amd64", "arm64"},
+		Note:  "当前稳定主版本，适合新部署",
+	},
+	{
+		Tag: "7.0", Name: "mongo:7.0", Family: FamilyMongo, Label: "MongoDB 7.0",
+		Archs: []string{"amd64", "arm64"},
+		Note:  "兼容上一代 MongoDB 工具链",
+	},
+	{
+		Tag: "6.0", Name: "mongo:6.0", Family: FamilyMongo, Label: "MongoDB 6.0（老项目兼容）",
+		Archs: []string{"amd64", "arm64"},
+	},
 }
 
 // List 返回全部可部署版本（顺序即界面顺序）。
@@ -92,17 +127,45 @@ func Find(tag string) (Image, bool) {
 	return Image{}, false
 }
 
-// DefaultImage 返回默认版本；清单为空时给一个安全值。
-func DefaultImage() Image {
+// FindFamily 在指定 family 内按 tag 或完整镜像名查版本。
+// MySQL 8.0 与 MongoDB 8.0 这类 tag 会跨引擎重复，部署与重建必须带 family 判断。
+func FindFamily(family, tag string) (Image, bool) {
+	tag = strings.TrimSpace(tag)
 	for _, img := range catalog {
-		if img.Default {
-			return img
+		if img.Family == family && (img.Tag == tag || img.Name == tag) {
+			return img, true
 		}
 	}
-	if len(catalog) > 0 {
-		return catalog[0]
+	return Image{}, false
+}
+
+// ListFamily 返回某个 family 的全部版本，顺序即界面顺序。
+func ListFamily(family string) []Image {
+	out := make([]Image, 0, len(catalog))
+	for _, img := range catalog {
+		if img.Family == family {
+			out = append(out, img)
+		}
 	}
-	return Image{Tag: "8.4", Name: "mysql:8.4", Family: FamilyMySQL, Label: "MySQL 8.4"}
+	return out
+}
+
+// DefaultFor 返回某个 family 的默认版本。
+func DefaultFor(family string) (Image, bool) {
+	var first Image
+	found := false
+	for _, img := range catalog {
+		if img.Family != family {
+			continue
+		}
+		if !found {
+			first, found = img, true
+		}
+		if img.Default {
+			return img, true
+		}
+	}
+	return first, found
 }
 
 // Supports 判断当前架构能不能跑这个镜像。

@@ -1,8 +1,11 @@
 #!/bin/bash
-# 卸载完成：清掉可再生的东西，用户数据一律保留
+# 卸载完成回调：默认只清可再生的缓存，用户数据一律保留。
 #
-# 为什么删引擎而不删数据：引擎解出来 1.6GB 上下，重装应用后一键就能重新下载或导入；
-# 而实例目录、备份、凭据删了就找不回来。想连数据一起清空，见文件末尾的说明。
+# 只有用户在卸载向导里明确选了「删除所有数据」（wizard_keep_data=delete）才清数据：
+# 实例目录、备份、凭据、元数据库，以及本应用创建的 Docker 容器与数据卷。
+# 共享文件夹里的备份不在应用目录下，任何时候都不动 —— 那是用户自己的文件。
+#
+# 脚本必须幂等：卸载回调可能被重复触发，第二次跑不能因为目录已不存在而报错。
 set -u
 
 LOG="${TRIM_TEMP_LOGFILE:-/tmp/niudbm_uninstall.log}"
@@ -11,13 +14,60 @@ exec >> "$LOG" 2>&1
 say() { echo "[$(date '+%F %T')] [uninstall_callback] $*"; }
 
 VAR="${TRIM_PKGVAR:-/var/apps/niudbm/var}"
+ETC="${TRIM_PKGETC:-/var/apps/niudbm/etc}"
 TMP="${TRIM_PKGTMP:-/var/apps/niudbm/tmp}"
+HOMEDIR="${TRIM_PKGHOME:-/var/apps/niudbm/home}"
 
-# 缓存可重建，直接清；实例数据、备份、凭据、容器全部保留
+# 向导字段就是环境变量名。取值只认文档里的写法，其余一律按「保留」处理：
+# 删数据不可恢复，宁可少删一次让人再手动清，也不能把一个意外取值当成删除指令。
+MODE="${wizard_keep_data:-keep}"
+
+say "start mode=$MODE"
+
+# 缓存/tmp 可再生，无论选哪种都清掉
 rm -rf "$VAR/cache" 2>/dev/null && say "cache removed"
 rm -rf "$TMP"/* 2>/dev/null
 
-say "kept: $VAR (instances/backups/niudbm.db)"
-say "如需彻底删除所有数据（不可恢复）：rm -rf $VAR"
+if [ "$MODE" != "delete" ]; then
+  say "kept: $VAR (instances/backups/niudbm.db)、$ETC (secrets)"
+  say "如需彻底删除：卸载时选「删除所有数据」，或手动 rm -rf $VAR $ETC"
+  say "ok"
+  exit 0
+fi
+
+# ---------- 用户明确要求删除全部数据 ----------
+
+# 容器是我们用 label 标记起来的，只删这些，绝不 docker system prune
+if command -v docker >/dev/null 2>&1; then
+  ids="$(docker ps -aq --filter label=niudbm.managed=true 2>/dev/null)"
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # 这里就是要按空格拆成多个容器 ID
+    docker rm -f $ids >/dev/null 2>&1 && say "containers removed"
+  else
+    say "no containers"
+  fi
+
+  # 数据卷名是 niudbm-<实例ID>-data；按前缀筛再核后缀，避免误删别的卷
+  for vol in $(docker volume ls -q --filter name=niudbm- 2>/dev/null); do
+    case "$vol" in
+      niudbm-*-data)
+        docker volume rm -f "$vol" >/dev/null 2>&1 && say "volume removed: $vol"
+        ;;
+      *)
+        say "skip volume: $vol"
+        ;;
+    esac
+  done
+else
+  say "WARN: 未找到 docker，跳过容器与数据卷清理（容器可能仍在运行）"
+fi
+
+for dir in "$VAR" "$ETC" "$HOMEDIR"; do
+  if [ -e "$dir" ]; then
+    rm -rf "$dir" && say "removed: $dir"
+  fi
+done
+
+say "all data removed"
 say "ok"
 exit 0

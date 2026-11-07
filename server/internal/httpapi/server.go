@@ -40,6 +40,9 @@ type Server struct {
 	locks sync.Map
 	// 部署串行：并行拉镜像会把 NAS 的 IO 与带宽打满
 	createMySQLMu sync.Mutex
+	// socket 表示当前监听的是统一网关的 Unix Socket。
+	// 只有这条通道上的身份头才可能是网关给的；端口通道上的同名头一律当不存在。
+	socket bool
 
 	// 定时备份调度：间隔可注入，测试里调成毫秒级
 	schedEvery time.Duration
@@ -55,6 +58,11 @@ type Server struct {
 	// 同步等会让前端只能转圈，改异步后由前端轮询阶段。
 	deployMu sync.Mutex
 	deploys  map[string]*deployTask
+	// jobCancels 只保存真正支持中断的异步任务，取消时由 handleCancelJob 触发。
+	jobCancels sync.Map
+
+	// externalTest 允许测试注入连接校验；生产环境为空，走真实驱动握手。
+	externalTest func(externalEndpoint) error
 }
 
 // New 构造服务。prefix 是网关对外前缀，例如 /app/niudbm。
@@ -66,20 +74,34 @@ func New(env platform.Env, prefix string, st *store.Store, paths Paths) *Server 
 		st:      st,
 		paths:   paths,
 		deploys: map[string]*deployTask{},
+		// 平台模式下默认按 socket 处理；main 会在真正监听之后用 SetListen 校正
+		socket: env.InPlatform,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/diag", s.handleDiag)
 
+	// 登录：身份由网关注入，换发本应用的会话 Cookie；应用不自建账号
+	mux.HandleFunc("GET /api/v1/auth/state", s.handleAuthState)
+	mux.HandleFunc("POST /api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("GET /api/v1/auth/me", s.handleAuthMe)
+
 	mux.HandleFunc("GET /api/v1/instances", s.handleListInstances)
 	mux.HandleFunc("POST /api/v1/instances", s.handleCreateInstance)
+	// 把用户已有数据库纳入管理，不要求 Docker，也不获得启动/停止权限。
+	mux.HandleFunc("POST /api/v1/instances/connect", s.handleConnectInstance)
 	// 部署进度：创建常驻服务是异步的，前端按 taskId 轮询阶段
 	mux.HandleFunc("GET /api/v1/deploy-tasks/{id}", s.handleGetDeployTask)
 
 	mux.HandleFunc("GET /api/v1/instances/{id}", s.handleGetInstance)
+	mux.HandleFunc("POST /api/v1/instances/{id}/test-connection", s.handleTestInstanceConnection)
 	mux.HandleFunc("PATCH /api/v1/instances/{id}", s.handleUpdateInstance)
 	mux.HandleFunc("DELETE /api/v1/instances/{id}", s.handleDeleteInstance)
+	mux.HandleFunc("GET /api/v1/instances/{id}/members", s.handleListMembers)
+	mux.HandleFunc("PUT /api/v1/instances/{id}/members/{uid}", s.handleUpsertMember)
+	mux.HandleFunc("DELETE /api/v1/instances/{id}/members/{uid}", s.handleDeleteMember)
 	// 部署现场：失败时容器日志会落盘，界面用这个接口把它拿出来
 	mux.HandleFunc("GET /api/v1/instances/{id}/deploy-log", s.handleDeployLog)
 
@@ -129,6 +151,7 @@ func New(env platform.Env, prefix string, st *store.Store, paths Paths) *Server 
 	mux.HandleFunc("POST /api/v1/instances/{id}/backups/{bid}/restore", s.handleRestoreBackup)
 	mux.HandleFunc("DELETE /api/v1/instances/{id}/backups/{bid}", s.handleDeleteBackup)
 	mux.HandleFunc("GET /api/v1/instances/{id}/backups/{bid}/download", s.handleDownloadBackup)
+	mux.HandleFunc("GET /api/v1/backups", s.handleListBackupCenter)
 
 	mux.HandleFunc("GET /api/v1/audit", s.handleListAudit)
 
@@ -162,8 +185,14 @@ func New(env platform.Env, prefix string, st *store.Store, paths Paths) *Server 
 	return s
 }
 
-// SetListen 记录实际监听方式，仅用于展示。
-func (s *Server) SetListen(info string) { s.listen = info }
+// SetListen 记录实际监听方式，并据此判定身份头是否可信。
+//
+// 只有 Unix Socket 上的 X-Trim-* 才可能来自飞牛网关；端口通道上任何人都能自己塞，
+// 所以那条通道上一律当没有身份（开发模式除外，见 gatewayIdentityOf）。
+func (s *Server) SetListen(info string) {
+	s.listen = info
+	s.socket = strings.HasPrefix(info, "unix:")
+}
 
 // lockInstance 取实例级互斥锁，返回的函数用于解锁。
 func (s *Server) lockInstance(id string) func() {
@@ -185,6 +214,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 网关是否剥离 gatewayPrefix 尚未真机确认（P-08），这里统一归一化：
 	// 带前缀就剔掉、不带前缀就原样，接口与静态资源都能命中。
 	r.URL.Path = s.stripPrefix(origPath)
+
+	// 业务接口一律要求已登录。白名单只有登录页真正需要的三个接口，
+	// 这样「新加接口忘了鉴权」不会发生：要放行必须显式写进 publicAPIPath。
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") && !publicAPIPath(r.URL.Path) {
+		if !s.requireSession(rec, r) {
+			log.Printf("%s %s 401 %s", r.Method, origPath, time.Since(start).Round(time.Millisecond))
+			return
+		}
+	}
 
 	s.mux.ServeHTTP(rec, r)
 	log.Printf("%s %s %d %s", r.Method, origPath, rec.status, time.Since(start).Round(time.Millisecond))
@@ -219,7 +257,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, r, map[string]any{
 		"status":    "ok",
 		"version":   s.env.Version,
-		"engine":    "mysql",
+		"engine":    engineMySQL,
+		"engines":   []string{engineMySQL, enginePostgres, engineMongoDB},
 		"instances": total,
 		"platform":  s.env.InPlatform,
 		// 前端据此决定是否允许部署：没有 Docker 时按钮要能说明原因，而不是点了才报错
@@ -228,6 +267,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, false); !ok {
+		return
+	}
 	report := diag.Run(s.env)
 	report.Env.Listen = s.listen
 	report.Env.IsAdmin = s.isAdmin(r)

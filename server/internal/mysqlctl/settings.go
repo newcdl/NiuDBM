@@ -160,7 +160,6 @@ var settingDefs = []settingDef{
 	},
 	{
 		key: "character_set_server", label: "服务端字符集", kind: "enum", apply: "restart", def: "utf8mb4",
-		defs:    map[string]string{"mysql/5.7": "latin1"},
 		options: []string{"utf8mb4", "utf8", "latin1"},
 		hint:    "新建库默认用的字符集。中文与 emoji 建议保持 utf8mb4。",
 	},
@@ -254,11 +253,6 @@ var settingDefs = []settingDef{
 		def:  "/var/lib/mysql/slow.log",
 		hint: "必须写容器内绝对路径（默认 /var/lib/mysql/slow.log）。写相对路径会让容器启动时遍历整个文件系统。",
 	},
-	{
-		key: "lower_case_table_names", label: "表名大小写策略", kind: "enum", apply: "restart", def: "0",
-		options: []string{"0", "1"},
-		hint:    "0 区分大小写（Linux 默认），1 全部转小写。从 Windows 迁库过来时才会用到，改这个要先清空数据目录。",
-	},
 }
 
 // optionRule 说明某个枚举值只在特定实现/版本上存在。
@@ -330,15 +324,6 @@ var settingByKey = func() map[string]settingDef {
 	}
 	return out
 }()
-
-// SettingKeys 返回全部白名单参数名。
-func SettingKeys() []string {
-	out := make([]string, 0, len(settingDefs))
-	for _, d := range settingDefs {
-		out = append(out, d.key)
-	}
-	return out
-}
 
 // Settings 读取当前值。实例没在运行时返回 ErrNotRunning。
 func (s Spec) Settings() ([]Setting, error) {
@@ -701,12 +686,16 @@ func isCnfDirKey(key string) bool {
 
 // initialCnf 是这台实例可用的参数及其默认值。
 func (s Spec) initialCnf() map[string]string {
+	if s.Flavor != "mysql" && s.Flavor != "mariadb" {
+		return map[string]string{}
+	}
 	out := make(map[string]string, len(settingDefs))
 	for _, d := range settingDefs {
-		if d.def == "" || !d.applies(s.Flavor, s.Series) {
+		value := defaultFor(d, s.Flavor, s.Series)
+		if value == "" || !d.applies(s.Flavor, s.Series) {
 			continue
 		}
-		out[d.key] = d.def
+		out[d.key] = value
 	}
 	return out
 }
@@ -759,7 +748,7 @@ var cnfGroups = []struct {
 		"read_rnd_buffer_size", "join_buffer_size", "binlog_cache_size",
 		"table_open_cache", "key_buffer_size",
 	}},
-	{"字符集与表名", []string{"character_set_server", "collation_server", "lower_case_table_names"}},
+	{"字符集与排序", []string{"character_set_server", "collation_server"}},
 	{"慢查询", []string{"slow_query_log", "long_query_time", "slow_query_log_file"}},
 	{"认证", []string{"default_authentication_plugin"}},
 }

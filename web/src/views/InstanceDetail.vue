@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { api, type CharsetOption, type ConnectionInfo, type DatabaseItem, type DbUser, type Instance } from '../api'
+import { api, engineLabel, type CharsetOption, type ConnectionInfo, type DatabaseItem, type DbUser, type Instance } from '../api'
 import { ElMessageBox } from 'element-plus'
 import { errText, formatBytes, formatTime } from '../format'
 import Modal from '../components/Modal.vue'
@@ -15,11 +15,12 @@ import TransferPanel from '../components/TransferPanel.vue'
 import { copyText, randomPassword } from '../clip'
 import { isCardView } from '../view-mode'
 import BackupPanel from '../components/BackupPanel.vue'
+import MembersPanel from '../components/MembersPanel.vue'
 
-type TabKey = 'overview' | 'databases' | 'config' | 'cnf' | 'backups' | 'transfer' | 'danger'
+type TabKey = 'overview' | 'databases' | 'config' | 'cnf' | 'backups' | 'transfer' | 'members' | 'danger'
 
 const props = defineProps<{ instanceId: string; initialTab?: TabKey | 'users' }>()
-const emit = defineEmits<{ back: []; changed: [] }>()
+const emit = defineEmits<{ back: []; changed: []; route: [tab: TabKey] }>()
 
 const ALL_TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -30,6 +31,7 @@ const ALL_TABS: { key: TabKey; label: string }[] = [
   { key: 'cnf', label: '配置文件' },
   { key: 'backups', label: '备份与恢复' },
   { key: 'transfer', label: '导入导出' },
+  { key: 'members', label: '成员' },
   { key: 'danger', label: '设置' },
 ]
 
@@ -45,10 +47,13 @@ const STATUS_TEXT: Record<string, string> = {
   restoring: '恢复中',
 }
 
-const PROFILE_TEXT: Record<string, string> = {
-  low: '轻量',
-  standard: '标准',
-  performance: '高性能',
+function statusLabel(): string {
+  const current = inst.value
+  if (!current) return '—'
+  if (current.mode === 'external') {
+    return current.status === 'running' ? '已连接' : '连接失败'
+  }
+  return STATUS_TEXT[current.status] ?? current.status
 }
 
 const inst = ref<Instance | null>(null)
@@ -79,13 +84,29 @@ const conn = ref<ConnectionInfo | null>(null)
 const showPwd = ref(false)
 const copyHint = ref('')
 const connectionError = ref('')
-// 常驻引擎（PostgreSQL / MySQL）才有连接信息、启停与用户管理
-// 这一版本只有 MySQL：实例都是常驻容器，详情页不再按引擎分支。
-// 原来 isServer 用来区分"服务型实例"和 SQLite 文件库，现在恒为真。
-const isServer = true
-// 「数据库」页签只有 MySQL 家族有意义：一个服务里放多个库
-const isMySQL = computed(() => inst.value?.engine === 'mysql')
-const TABS = computed(() => ALL_TABS.filter((t) => t.key !== 'databases' || isMySQL.value))
+const isExternal = computed(() => inst.value?.mode === 'external')
+const isPostgres = computed(() => inst.value?.engine === 'postgres')
+const isMongo = computed(() => inst.value?.engine === 'mongodb')
+const canOperate = computed(() => inst.value?.accessRole === 'operator' || inst.value?.accessRole === 'admin')
+const canAdmin = computed(() => inst.value?.accessRole === 'admin')
+// 两个引擎都有「配置文件」页，但内容不同：
+// MySQL 是 conf.d 里的一段，PG 是 PGDATA 里的 postgresql.conf / pg_hba.conf，
+// 由 ConfigFilePanel 按引擎切换文件清单。
+const TABS = computed(() =>
+  ALL_TABS.filter((item) => {
+    const caps = inst.value?.capabilities
+    if (!caps) return item.key === 'overview' || item.key === 'danger'
+    if (item.key === 'config') return caps.config
+    if (item.key === 'cnf') return caps.configFile
+    if (item.key === 'backups') return caps.backup
+    if (item.key === 'transfer') return caps.transfer
+    if (item.key === 'members') return caps.members
+    return true
+  }),
+)
+watch(TABS, (items) => {
+  if (!items.some((item) => item.key === tab.value)) tab.value = 'overview'
+})
 // 地址是 host:port：局域网里其他应用就靠这一串连进来
 const addr = computed(() => (conn.value ? `${conn.value.host}:${conn.value.port}` : ''))
 const title = computed(() => inst.value?.name ?? '数据库')
@@ -110,12 +131,7 @@ async function load(): Promise<void> {
   }
 }
 
-// loadConn 只对常驻引擎有意义；SQLite 没有连接信息，失败也不该占错误提示
 async function loadConn(): Promise<void> {
-  if (false) {
-    conn.value = null
-    return
-  }
   connectionError.value = ''
   try {
     conn.value = await api.connection(props.instanceId)
@@ -284,10 +300,30 @@ const FALLBACK_CHARSETS: CharsetOption[] = [
   { value: 'latin1', label: 'latin1 · 仅英文', collation: 'latin1_swedish_ci' },
 ]
 
+// PG 的"字符集"其实是库编码：utf8mb4 这类名字在 PG 里不存在，
+// 兜底清单必须分开，否则实例没跑时用户会选到一个建不出来的编码
+const FALLBACK_ENCODINGS: CharsetOption[] = [
+  { value: 'UTF8', label: 'UTF8 · 推荐，完整 Unicode', collation: '', recommended: true },
+  { value: 'GB18030', label: 'GB18030 · 简体中文超集', collation: '' },
+  { value: 'GBK', label: 'GBK · 中文旧系统', collation: '' },
+  { value: 'LATIN1', label: 'LATIN1 · 西欧语言', collation: '' },
+]
+
 const charsets = ref<CharsetOption[]>(FALLBACK_CHARSETS)
 const charsetsLoaded = ref(false)
 
+/** 当前引擎下建库时的默认"字符集"：MySQL 是 utf8mb4，PG 是 UTF8。 */
+function defaultCharset(): string {
+  if (isMongo.value) return ''
+  return isPostgres.value ? 'UTF8' : 'utf8mb4'
+}
+
 async function loadCharsets(): Promise<void> {
+  if (isMongo.value) {
+    charsets.value = []
+    charsetsLoaded.value = true
+    return
+  }
   if (charsetsLoaded.value) return
   try {
     const res = await api.listCharsets(props.instanceId)
@@ -307,9 +343,13 @@ const LEVELS = [
 ]
 
 function openCreateDB(): void {
+  // 切换引擎后兜底清单也要跟着换（详情页会在两个服务之间来回切换）
+  if (!charsetsLoaded.value) {
+    charsets.value = isMongo.value ? [] : isPostgres.value ? FALLBACK_ENCODINGS : FALLBACK_CHARSETS
+  }
   dbForm.value = {
     name: '',
-    charset: 'utf8mb4',
+    charset: defaultCharset(),
     withUser: true,
     user: '',
     password: randomPassword(),
@@ -527,6 +567,7 @@ async function restart(): Promise<void> {
 
 // 备份/恢复会改变体积与状态，回到详情时刷新一次头部信息
 watch(tab, (next) => {
+  emit('route', next)
   showPwd.value = false
   copyHint.value = ''
   if (next === 'overview') void load()
@@ -535,7 +576,7 @@ watch(tab, (next) => {
 
 onMounted(async () => {
   await load()
-  if (props.initialTab === 'databases' && isMySQL.value) await loadDatabases()
+  if (props.initialTab === 'databases') await loadDatabases()
 })
 </script>
 
@@ -548,22 +589,22 @@ onMounted(async () => {
         <div class="hero-title">
           <h1>{{ title }}</h1>
           <span v-if="inst" class="pill" :class="statusClass">
-            {{ STATUS_TEXT[inst.status] ?? inst.status }}
+            {{ statusLabel() }}
           </span>
         </div>
         <div class="hero-meta">
-          <span v-if="inst" class="mono">MySQL {{ inst.engineVersion }}</span>
+          <span v-if="inst" class="mono">{{ engineLabel(inst.engine) }} {{ inst.engineVersion }}</span>
           <span v-if="inst && inst.port" class="mono">端口 {{ inst.port }}</span>
-          <span v-if="inst">{{ formatBytes(inst.sizeBytes) }}</span>
+          <span v-if="inst">{{ isExternal ? '外部库' : formatBytes(inst.sizeBytes) }}</span>
           <span v-if="inst && inst.tableCount !== undefined">{{ inst.tableCount }} 张表</span>
           <span v-if="inst" class="muted">创建于 {{ formatTime(inst.createdAt) }}</span>
         </div>
       </div>
       <div class="hero-actions">
         <button v-if="inst" type="button" class="btn btn-sm" @click="connOpen = true">连接信息</button>
-        <button v-if="inst" type="button" class="btn btn-sm" @click="usersOpen = true">用户</button>
+        <button v-if="inst?.capabilities.users" type="button" class="btn btn-sm" @click="usersOpen = true">用户</button>
         <button
-          v-if="inst && inst.status === 'running'"
+          v-if="inst?.capabilities.startStop && canOperate && inst.status === 'running'"
           type="button"
           class="btn btn-sm"
           :disabled="busy"
@@ -572,7 +613,7 @@ onMounted(async () => {
           重启
         </button>
         <button
-          v-if="inst"
+          v-if="inst?.capabilities.startStop && canOperate"
           type="button"
           class="btn btn-sm"
           :class="inst.status === 'running' ? '' : 'btn-primary'"
@@ -603,10 +644,10 @@ onMounted(async () => {
 
       <!-- 概览：左连接右资源，下面是服务信息，三块都只放一眼要看的东西 -->
       <div v-if="tab === 'overview'" class="ov">
-        <section v-if="isServer" class="card">
+        <section class="card">
           <header class="card-head">
             <h2>连接信息</h2>
-            <button type="button" class="btn-link" @click="connOpen = true">容器 / 外部地址 ›</button>
+            <button type="button" class="btn-link" @click="connOpen = true">查看连接信息 ›</button>
           </header>
           <p v-if="connectionError" class="notice notice-warn">{{ connectionError }}</p>
           <dl class="kv">
@@ -623,21 +664,25 @@ onMounted(async () => {
             </dd>
             <dt>密码</dt>
             <dd class="mono pwd">
-              <span>{{ showPwd ? conn?.password || '—' : '••••••••' }}</span>
-              <button type="button" class="btn btn-sm" :disabled="!conn" @click="showPwd = !showPwd">
+              <span>{{ canOperate ? (showPwd ? conn?.password || '—' : '••••••••') : '仅运维者可见' }}</span>
+              <button v-if="canOperate" type="button" class="btn btn-sm" :disabled="!conn" @click="showPwd = !showPwd">
                 {{ showPwd ? '隐藏' : '显示' }}
               </button>
-              <button type="button" class="btn btn-sm" :disabled="!conn"
+              <button v-if="canOperate" type="button" class="btn btn-sm" :disabled="!conn"
                 @click="copy(conn?.password ?? '', '密码')">复制</button>
             </dd>
           </dl>
           <p v-if="copyHint" role="status">{{ copyHint }}</p>
           <p class="tip">
-            root 用于建库、建账号；应用接入请在「数据库与账号」里按库建最小权限账号。
+            {{
+              isExternal
+                ? '这是已接入数据库的管理账号。新建业务账号请在「数据库与账号」中完成。'
+                : 'root 用于建库、建账号；应用接入请在「数据库与账号」里按库建最小权限账号。'
+            }}
           </p>
         </section>
 
-        <section class="card">
+        <section v-if="!isExternal" class="card">
           <header class="card-head">
             <h2>运行资源</h2>
           </header>
@@ -680,10 +725,20 @@ onMounted(async () => {
           </header>
           <dl class="kv kv-grid">
             <dt>引擎版本</dt><dd>{{ inst.engine }} {{ inst.engineVersion || '内置' }}</dd>
-            <dt>运行方式</dt><dd>Docker 容器</dd>
-            <dt>存储方式</dt>
-            <dd>{{ inst.storageKind === 'volume' ? 'Docker 命名卷' : '宿主机目录' }}</dd>
-            <dt>数据位置</dt><dd class="mono ellipsis" :title="inst.filePath">{{ inst.filePath }}</dd>
+            <dt>{{ isExternal ? '连接方式' : '镜像地址' }}</dt>
+            <dd class="mono ellipsis" :title="inst.image">
+              {{ isExternal ? `${inst.host}:${inst.port}` : inst.image || '—' }}
+            </dd>
+            <dt>运行方式</dt><dd>{{ isExternal ? '外部连接' : 'Docker 容器' }}</dd>
+            <template v-if="!isExternal">
+              <dt>存储方式</dt>
+              <dd>{{ inst.storageKind === 'volume' ? 'Docker 命名卷' : '宿主机目录' }}</dd>
+              <dt>数据位置</dt><dd class="mono ellipsis" :title="inst.filePath">{{ inst.filePath }}</dd>
+            </template>
+            <template v-else>
+              <dt>TLS</dt><dd>{{ inst.tlsMode === 'require' ? '加密连接（不校验证书）' : '未加密' }}</dd>
+              <dt>管理账号</dt><dd class="mono">{{ inst.username }}</dd>
+            </template>
             <dt>创建时间</dt><dd>{{ formatTime(inst.createdAt) }}</dd>
             <dt v-if="inst.statusReason">状态说明</dt>
             <dd v-if="inst.statusReason" class="bad-text">{{ inst.statusReason }}</dd>
@@ -701,9 +756,10 @@ onMounted(async () => {
             {{ dbLoading ? '读取中' : '刷新' }}
           </button>
           <button
+            v-if="canOperate"
             type="button"
             class="btn btn-sm btn-primary"
-            :disabled="inst.status !== 'running'"
+            :disabled="inst.status !== 'running' || !canOperate"
             :title="inst.status === 'running' ? '' : '服务未运行，先启动再建库'"
             @click="openCreateDB"
           >
@@ -711,9 +767,13 @@ onMounted(async () => {
           </button>
         </div>
         <p class="tip">
-          这是端口 {{ inst.port || '—' }} 上的 MySQL 服务，里面可以建多个数据库。
-          它们共用这个服务的连接地址和账号体系，各自有独立的表与数据。
+          这是端口 {{ inst.port || '—' }} 上的 {{ engineLabel(inst.engine) }} 服务，里面可以建多个数据库。
+          {{ isMongo ? '每个数据库包含一组集合，账号按数据库授予 read / readWrite / dbOwner 角色。' : '它们共用这个服务的连接地址和账号体系，各自有独立的表与数据。' }}
           「授权用户」是这个库上能进得来的账号——点开看全部，改授权在右上角「用户」里。
+          <template v-if="isPostgres">
+            PostgreSQL 的库名区分大小写，删除库会连库里的表一起删；账号能否连进来还受
+            <code>pg_hba.conf</code> 约束（「配置文件」页可改）。
+          </template>
         </p>
         <div v-if="dbError" class="notice notice-bad">
           <span>{{ dbError }}</span>
@@ -725,8 +785,8 @@ onMounted(async () => {
           <thead>
             <tr>
               <th>库名</th>
-              <th>字符集</th>
-              <th>表数</th>
+              <th v-if="!isMongo">{{ isPostgres ? '编码' : '字符集' }}</th>
+              <th>{{ isMongo ? '集合数' : '表数' }}</th>
               <th>大小</th>
               <th>授权用户</th>
               <th></th>
@@ -736,7 +796,7 @@ onMounted(async () => {
             <template v-for="d in pagedDbs" :key="d.name">
               <tr>
                 <td class="mono">{{ d.name }}</td>
-                <td>{{ d.charset }}</td>
+                <td v-if="!isMongo">{{ d.charset }}</td>
                 <td>{{ d.tableCount }}</td>
                 <td>{{ formatBytes(d.sizeBytes) }}</td>
                 <td>
@@ -745,9 +805,9 @@ onMounted(async () => {
                   </button>
                 </td>
                 <td class="row-actions">
-                  <button type="button" class="btn btn-sm" @click="tab = 'backups'">备份列表</button>
-                  <button type="button" class="btn btn-sm" @click="tab = 'transfer'">导入</button>
-                  <button type="button" class="btn btn-sm btn-danger" :disabled="dbBusy" @click="openDropDB(d.name)">
+                  <button v-if="inst.capabilities.backup" type="button" class="btn btn-sm" @click="tab = 'backups'">备份列表</button>
+                  <button v-if="inst.capabilities.transfer && canOperate" type="button" class="btn btn-sm" @click="tab = 'transfer'">导入</button>
+                  <button v-if="canOperate" type="button" class="btn btn-sm btn-danger" :disabled="dbBusy" @click="openDropDB(d.name)">
                     删除
                   </button>
                 </td>
@@ -760,10 +820,10 @@ onMounted(async () => {
           <article v-for="d in pagedDbs" :key="d.name" class="db-card">
             <header class="db-card-head">
               <span class="mono db-name">{{ d.name }}</span>
-              <span class="muted small">{{ d.charset }}</span>
+              <span v-if="!isMongo" class="muted small">{{ isPostgres ? '编码 ' + d.charset : d.charset }}</span>
             </header>
             <dl class="db-card-meta">
-              <div><dt>表数</dt><dd>{{ d.tableCount }}</dd></div>
+              <div><dt>{{ isMongo ? '集合数' : '表数' }}</dt><dd>{{ d.tableCount }}</dd></div>
               <div><dt>大小</dt><dd>{{ formatBytes(d.sizeBytes) }}</dd></div>
             </dl>
             <div class="users-cell">
@@ -774,6 +834,7 @@ onMounted(async () => {
             </div>
             <div class="db-card-actions">
               <button
+                v-if="canOperate"
                 type="button"
                 class="btn btn-sm"
                 :disabled="dbBusy || inst.status !== 'running'"
@@ -781,7 +842,7 @@ onMounted(async () => {
               >
                 建账号
               </button>
-              <button type="button" class="btn btn-sm btn-danger" :disabled="dbBusy" @click="openDropDB(d.name)">
+              <button v-if="canOperate" type="button" class="btn btn-sm btn-danger" :disabled="dbBusy" @click="openDropDB(d.name)">
                 删除
               </button>
             </div>
@@ -825,50 +886,76 @@ onMounted(async () => {
         <p v-else class="muted">这个库还没有授权任何账号。</p>
       </Modal>
 
-      <ConnDrawer v-if="isServer" v-model="connOpen" :instance-id="instanceId" @changed="load()" />
-      <UserDrawer v-if="isServer" v-model="usersOpen" :instance-id="instanceId" @changed="loadDatabases()" />
+      <ConnDrawer v-model="connOpen" :instance-id="instanceId" :can-manage="canOperate" @changed="load()" />
+      <UserDrawer
+        v-model="usersOpen"
+        :instance-id="instanceId"
+        :engine="inst.engine"
+        :can-manage="canOperate"
+        @changed="loadDatabases()"
+      />
 
-      <ConfigPanel v-if="tab === 'config'" :instance-id="instanceId" :engine="inst.engine" @changed="load()" />
-      <ConfigFilePanel v-if="tab === 'cnf'" :instance-id="instanceId" @changed="load()" />
-      <TransferPanel v-if="tab === 'transfer'" :instance-id="instanceId" :engine="inst.engine" @changed="load()" />
+      <ConfigPanel
+        v-if="tab === 'config' && inst.capabilities.config"
+        :instance-id="instanceId"
+        :engine="inst.engine"
+        @changed="load()"
+      />
+      <ConfigFilePanel
+        v-if="tab === 'cnf' && inst.capabilities.configFile"
+        :instance-id="instanceId"
+        :engine="inst.engine"
+        :engine-version="inst.engineVersion"
+        @changed="load()"
+      />
+      <TransferPanel
+        v-if="tab === 'transfer' && inst.capabilities.transfer"
+        :instance-id="instanceId"
+        :engine="inst.engine"
+        @changed="load()"
+      />
       <BackupPanel
-        v-if="tab === 'backups'"
+        v-if="tab === 'backups' && inst.capabilities.backup"
         :instance-id="instanceId"
         :instance-name="title"
-        :engine="inst?.engine ?? 'sqlite'"
+        :engine="inst?.engine ?? 'mysql'"
         @changed="load()"
+      />
+      <MembersPanel
+        v-if="tab === 'members' && inst.capabilities.members"
+        :instance-id="instanceId"
+        :can-manage="canAdmin"
       />
 
       <div v-if="tab === 'danger'" class="danger">
         <section class="card">
           <h2>服务信息</h2>
           <dl class="kv">
-            <dt>{{ isServer ? '服务 ID' : '数据库 ID' }}</dt>
+            <dt>服务 ID</dt>
             <dd class="mono">{{ inst?.id ?? '—' }}</dd>
-            <dt>{{ isServer ? '数据目录' : '数据文件' }}</dt>
+            <dt>{{ isExternal ? '连接地址' : '数据目录' }}</dt>
             <dd class="mono">{{ inst?.filePath ?? '—' }}</dd>
-            <dt v-if="isServer">端口</dt>
-            <dd v-if="isServer" class="mono">{{ inst?.port ?? '—' }}</dd>
+            <dt>端口</dt>
+            <dd class="mono">{{ inst?.port ?? '—' }}</dd>
             <dt>最后变更</dt>
             <dd>{{ inst ? formatTime(inst.updatedAt) : '—' }}</dd>
           </dl>
-          <button type="button" class="btn" @click="openRename">修改名称</button>
+          <button v-if="canAdmin" type="button" class="btn" @click="openRename">修改名称</button>
         </section>
 
         <section class="card danger-card">
-          <h2>{{ isServer ? '删除服务' : '删除数据库' }}</h2>
+          <h2>删除服务</h2>
           <p class="tip">
-            <template v-if="isServer">
+            <template v-if="isExternal">
+              这里只会移除本应用中的连接记录和保存的凭据，不会删除或修改外部数据库。
+            </template>
+            <template v-else>
               服务删除后，它里面建的所有数据库都会一起消失。选择「保留数据文件」可留下文件以便手工找回，
               不保留则移入回收站目录，卸载应用才会清理。
             </template>
-            <template v-else>
-              删除后数据库会从列表消失。选择「保留数据文件」会留下数据库文件以便手工找回，
-              不保留则移入回收站目录，卸载应用才会清理。
-            </template>
           </p>
-          <button type="button" class="btn btn-danger" @click="openDelete">
-            {{ isServer ? '删除服务' : '删除数据库' }}
+          <button v-if="canAdmin" type="button" class="btn btn-danger" @click="openDelete">
+            {{ isExternal ? '移除连接' : '删除服务' }}
           </button>
         </section>
       </div>
@@ -890,13 +977,20 @@ onMounted(async () => {
         <span class="field-hint">字母、数字、下划线，字母或下划线开头；建好后不建议改名。</span>
       </div>
 
-      <div class="field">
-        <label for="db-charset">字符集</label>
+      <div v-if="!isMongo" class="field">
+        <label for="db-charset">{{ isPostgres ? '编码' : '字符集' }}</label>
         <select id="db-charset" v-model="dbForm.charset" class="select" :disabled="dbBusy">
           <option v-for="c in charsets" :key="c.value" :value="c.value">{{ c.label }}</option>
         </select>
-        <span class="field-hint">建好后可以改表，但改库的默认字符集不会转换已有数据。</span>
+        <span class="field-hint">
+          {{
+            isPostgres
+              ? 'PG 的编码在库级固定；非 UTF8 编码会按 C locale 建库，排序规则以字节序为准。'
+              : '建好后可以改表，但改库的默认字符集不会转换已有数据。'
+          }}
+        </span>
       </div>
+      <p v-else class="tip">MongoDB 会在库中创建初始集合让空库立即可见，之后可以直接建集合和账号。</p>
 
       <div class="field">
         <label class="row">
@@ -1008,7 +1102,7 @@ onMounted(async () => {
       </template>
     </Modal>
 
-    <Modal v-if="renaming" :title="isServer ? '修改服务名称' : '修改数据库名称'" :busy="busy" @close="renaming = false">
+    <Modal v-if="renaming" title="修改服务名称" :busy="busy" @close="renaming = false">
       <div class="field">
         <label for="n-name">新名称</label>
         <input
@@ -1028,12 +1122,17 @@ onMounted(async () => {
       </template>
     </Modal>
 
-    <Modal v-if="deleting" :title="isServer ? '删除服务' : '删除数据库'" :busy="busy" @close="deleting = false">
+    <Modal v-if="deleting" :title="isExternal ? '移除连接' : '删除服务'" :busy="busy" @close="deleting = false">
       <p class="tip">
-        <strong>{{ title }}</strong> 将被删除，列表里再也看不到它。
+        <template v-if="isExternal">
+          <strong>{{ title }}</strong> 的连接记录和保存的凭据将被移除，外部数据库本身不会受到影响。
+        </template>
+        <template v-else>
+          <strong>{{ title }}</strong> 将被删除，列表里再也看不到它。
+        </template>
       </p>
       <div class="field">
-        <label for="d-confirm">{{ isServer ? '输入服务名以确认' : '输入数据库名以确认' }}</label>
+        <label for="d-confirm">输入服务名以确认</label>
         <input
           id="d-confirm"
           v-model="confirmName"
@@ -1042,7 +1141,7 @@ onMounted(async () => {
           @keyup.enter="submitDelete"
         />
       </div>
-      <label class="check">
+      <label v-if="!isExternal" class="check">
         <input v-model="keepData" type="checkbox" />
         <span>保留数据（docker 卷与宿主机目录都留着；不勾选则一并清理）</span>
       </label>
@@ -1055,7 +1154,7 @@ onMounted(async () => {
           :disabled="busy || confirmName !== title"
           @click="submitDelete"
         >
-          {{ busy ? '删除中…' : '确认删除' }}
+          {{ busy ? '处理中…' : isExternal ? '确认移除' : '确认删除' }}
         </button>
       </template>
     </Modal>

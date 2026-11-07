@@ -6,35 +6,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"niudbm/server/internal/dockerctl"
 	"niudbm/server/internal/images"
+	"niudbm/server/internal/mongoctl"
 	"niudbm/server/internal/mysqlctl"
 	"niudbm/server/internal/store"
 )
-
-// seriesAtLeast 按数字段比较版本号。
-//
-// 不能直接拿字符串比：MySQL 26.10 这种"年份.月份"的新版本号在字典序里小于 "8.0"，
-// 会把新版当成 5.7 一样处理，少传参数。缺的段按 0 算。
-func seriesAtLeast(tag, min string) bool {
-	a := strings.Split(tag, ".")
-	b := strings.Split(min, ".")
-	for i := 0; i < len(b); i++ {
-		x, y := 0, 0
-		if i < len(a) {
-			x, _ = strconv.Atoi(a[i])
-		}
-		y, _ = strconv.Atoi(b[i])
-		if x != y {
-			return x > y
-		}
-	}
-	return true
-}
 
 // 运行方式只剩容器一种。
 //
@@ -48,11 +28,17 @@ const (
 	storageBind   = "bind"
 )
 
-// 容器内 MySQL 的固定参数：端口、数据目录与配置目录不随版本变化。
+// 容器内的固定参数：端口与数据目录不随版本变化。
 const (
-	containerMySQLPort = 3306
-	containerDataPath  = "/var/lib/mysql"
-	// containerConfDir 是镜像读额外配置的目录，宿主的 conf 目录绑挂到这里。
+	containerMySQLPort    = 3306
+	containerDataPath     = "/var/lib/mysql"
+	containerPostgresPort = 5432
+	containerMongoPort    = 27017
+	// PG 官方镜像的数据目录；不要在它下面再套一层，否则 entrypoint 会重复 initdb
+	containerPgDataPath = "/var/lib/postgresql/data"
+	containerMongoPath  = "/data/db"
+	// containerConfDir 是 MySQL 系镜像读额外配置的目录，宿主的 conf 目录绑挂到这里。
+	// PG 没有 conf.d：它的参数走 ALTER SYSTEM，因此不挂这个目录。
 	containerConfDir = "/etc/mysql/conf.d"
 )
 
@@ -94,7 +80,9 @@ type dockerPlan struct {
 	DataPath      string // 容器内数据目录
 	Env           map[string]string
 	Command       []string
-	ConfDir       string // 非空时把宿主目录挂成 /etc/mysql/conf.d
+	ConfDir       string // 非空时把宿主配置目录挂进容器的 ConfTarget
+	ConfTarget    string
+	ValidateCnf   bool // 仅 MySQL/MariaDB 需要 mysqld --verbose --help 预检
 }
 
 // planFor 根据镜像与账号密码算出容器参数。
@@ -110,6 +98,41 @@ func (s *Server) planFor(in store.Instance, img images.Image, rootPassword, appP
 		ContainerPort: containerMySQLPort,
 		DataPath:      containerDataPath,
 		ConfDir:       filepath.Join(base, "conf"),
+		ConfTarget:    containerConfDir,
+		ValidateCnf:   true,
+	}
+	if img.Family == images.FamilyMongo {
+		plan.ContainerPort = containerMongoPort
+		plan.DataPath = containerMongoPath
+		plan.ConfDir = filepath.Join(base, "conf")
+		plan.ConfTarget = mongoctl.ContainerConfDir
+		plan.ValidateCnf = false
+		if err := mongoctl.EnsureConfig(filepath.Join(plan.ConfDir, mongoctl.ConfigFileName), img.Tag); err != nil {
+			return dockerPlan{}, fmt.Errorf("创建 mongod.conf 失败：%w", err)
+		}
+		plan.Command = []string{"mongod", "--config", mongoctl.ContainerConfFile}
+		plan.Env = map[string]string{
+			"MONGO_INITDB_ROOT_USERNAME": mongoctl.RootUser,
+			"MONGO_INITDB_ROOT_PASSWORD": rootPassword,
+		}
+		return plan, nil
+	}
+	if img.Family == images.FamilyPostgres {
+		// PG 的初始化只有一件事：给 postgres 超级用户设密码。
+		// 不传 POSTGRES_DB：传了会顺手建一个库，用户会以为"建服务"就等于"建好一个库"。
+		plan.ContainerPort = containerPostgresPort
+		plan.DataPath = containerPgDataPath
+		// 没有 conf.d：参数由 ALTER SYSTEM 写进 postgresql.auto.conf
+		plan.ConfDir = ""
+		plan.ConfTarget = ""
+		plan.ValidateCnf = false
+		plan.Env = map[string]string{
+			"POSTGRES_PASSWORD": rootPassword,
+			// 显式指定认证方式：老镜像默认 md5，新版默认 scram，统一成 scram 更安全
+			"POSTGRES_HOST_AUTH_METHOD": "scram-sha-256",
+		}
+		plan.Command = nil
+		return plan, nil
 	}
 	if img.Family == images.FamilyMySQL {
 		// 不传 MYSQL_DATABASE：建出来的服务是空的，库由用户在页面里自己建。
@@ -198,10 +221,14 @@ func (s *Server) startDocker(ctx context.Context, in store.Instance, plan docker
 	// 只读报错，真正的原因（unknown variable xxx）反而看不到。
 	if plan.ConfDir != "" {
 		checkCtx, checkCancel := context.WithTimeout(ctx, time.Minute)
-		err := client.CheckCnf(checkCtx, image, plan.ConfDir, containerConfDir, plan.Command)
-		checkCancel()
-		if err != nil {
-			return err
+		if plan.ValidateCnf {
+			err := client.CheckCnf(checkCtx, image, plan.ConfDir, plan.ConfTarget, plan.Command)
+			checkCancel()
+			if err != nil {
+				return err
+			}
+		} else {
+			checkCancel()
 		}
 	}
 
@@ -236,9 +263,9 @@ func (s *Server) startDocker(ctx context.Context, in store.Instance, plan docker
 		opt.DataDir = dir
 		opt.UseVolume = false
 	}
-	if plan.ConfDir != "" {
-		// 配置目录挂成 conf.d：配置页写进去的文件容器重启后依然生效
-		opt.VolumeExtra = [][2]string{{plan.ConfDir, containerConfDir}}
+	if plan.ConfDir != "" && plan.ConfTarget != "" {
+		// 配置目录挂载后，页面上写入的文件容器重启后依然生效
+		opt.VolumeExtra = [][2]string{{plan.ConfDir, plan.ConfTarget}}
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
@@ -254,7 +281,10 @@ func (s *Server) startDocker(ctx context.Context, in store.Instance, plan docker
 // 加速站同时挂掉时还要能退回官方源，不然一次镜像站故障就会让整个功能不可用。
 func (s *Server) imageCandidates(image string) []string {
 	out := make([]string, 0, 2)
-	if s.env.DockerMirror != "" {
+	// 只给"官方短名"（mysql:8.4）加加速站前缀。
+	// 已经带仓库的地址（docker.m.daocloud.io/library/postgres:17、私有 registry:5000/db:17）
+	// 再拼一次就成了 registry/library/registry/...，拉取必然失败。
+	if s.env.DockerMirror != "" && !strings.Contains(image, "/") {
 		out = append(out, s.env.DockerMirror+"library/"+image)
 	}
 	return append(out, image)
@@ -298,6 +328,9 @@ func (s *Server) ensureImage(ctx context.Context, client *dockerctl.Client, imag
 //
 // "保留数据"只对卷有意义：绑挂目录是用户自己的路径，删不删由调用方决定。
 func (s *Server) removeDocker(ctx context.Context, in store.Instance, removeVolume bool) error {
+	if isExternal(in) {
+		return nil
+	}
 	client := s.dockerClient()
 	if _, err := client.Available(ctx); err != nil {
 		// Docker 没起来时容器也跑不了，残留文件会让下次 docker run 失败；
@@ -315,11 +348,20 @@ func (s *Server) removeDocker(ctx context.Context, in store.Instance, removeVolu
 
 // dockerPlanFor 按台账重建一份 docker 运行计划（改端口、改配额后重建容器用）。
 func (s *Server) dockerPlanFor(in store.Instance) (dockerPlan, error) {
-	img, ok := images.Find(in.EngineVersion)
+	img, ok := images.FindFamily(familyOf(in.Engine), in.EngineVersion)
 	if !ok {
 		return dockerPlan{}, fmt.Errorf("找不到版本 %s 的镜像信息，无法重建容器", in.EngineVersion)
 	}
-	return s.planFor(in, img, s.readRootSecret(in.ID), s.readSecret(in.ID))
+	plan, err := s.planFor(in, img, s.readRootSecret(in.ID), s.readSecret(in.ID))
+	if err != nil {
+		return dockerPlan{}, err
+	}
+	// 重建必须沿用它当初用的地址：用户填过加速站/私有仓库，这里回退到官方名
+	// 会在国内网络下直接拉不动，看起来就像"改个端口把服务搞坏了"
+	if in.Image != "" {
+		plan.Image = in.Image
+	}
+	return plan, nil
 }
 
 // rebuildDocker 用台账里的最新配置重建容器并拉起。
@@ -332,20 +374,39 @@ func (s *Server) rebuildDocker(ctx context.Context, in store.Instance) error {
 	return s.startDocker(ctx, in, plan)
 }
 
-// pickVersion 解析"用哪个镜像版本"。
-//
-// 版本就来自 images 清单：没指定用默认 LTS，指定了必须存在且当前架构有官方镜像。
-func (s *Server) pickVersion(want string) (images.Image, error) {
-	if strings.TrimSpace(want) == "" {
-		return images.DefaultImage(), nil
+// familyOf 把引擎标识映射到镜像清单的 family。
+func familyOf(engine string) string {
+	switch engine {
+	case enginePostgres:
+		return images.FamilyPostgres
+	case engineMongoDB:
+		return images.FamilyMongo
+	default:
+		return images.FamilyMySQL
 	}
-	img, ok := images.Find(want)
+}
+
+// pickVersionFor 按引擎解析版本。
+//
+// 两个引擎的版本号会撞（比如都叫"16"），所以必须带上 family 一起判断：
+// 否则在 PG 里填一个 MySQL 的版本号会被"找到"并真去拉错镜像。
+func (s *Server) pickVersionFor(engine, want string) (images.Image, error) {
+	family := familyOf(engine)
+	if strings.TrimSpace(want) == "" {
+		img, ok := images.DefaultFor(family)
+		if !ok {
+			return images.Image{}, fmt.Errorf("镜像清单里没有 %s 的可用版本", engineLabel(engine))
+		}
+		return img, nil
+	}
+	img, ok := images.FindFamily(family, want)
 	if !ok {
 		names := make([]string, 0, 4)
-		for _, item := range images.List() {
+		for _, item := range images.ListFamily(family) {
 			names = append(names, item.Tag)
 		}
-		return images.Image{}, fmt.Errorf("不支持这个版本：%s；可选 %s", want, strings.Join(names, " / "))
+		return images.Image{}, fmt.Errorf("不支持这个版本：%s；%s 可选 %s",
+			want, engineLabel(engine), strings.Join(names, " / "))
 	}
 	if !img.Supports(s.arch()) {
 		return images.Image{}, fmt.Errorf("%s 的官方镜像没有 %s 架构，请换一个版本", img.Label, s.arch())
@@ -369,13 +430,4 @@ func (s *Server) dockerLogTail(ctx context.Context, in store.Instance, lines int
 		return "", err
 	}
 	return client.Logs(ctx, containerNameOf(in), lines)
-}
-
-// portInUseByOther 判断端口是否已被别的容器占用（本应用实例自己的容器不算）。
-func (s *Server) portInUseByOther(ctx context.Context, port int, self store.Instance) bool {
-	owner := s.dockerPortOwner(ctx, port)
-	if owner == "" {
-		return false
-	}
-	return owner != containerNameOf(self)
 }

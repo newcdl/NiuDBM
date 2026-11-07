@@ -6,7 +6,7 @@ import { api, type ConnectionInfo } from '../api'
 import { errText } from '../format'
 import { copyText, randomPassword } from '../clip'
 
-const props = defineProps<{ instanceId: string; modelValue: boolean }>()
+const props = defineProps<{ instanceId: string; modelValue: boolean; canManage?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean]; changed: [] }>()
 
 const conn = ref<ConnectionInfo | null>(null)
@@ -27,16 +27,27 @@ const open = computed({
   set: (v: boolean) => emit('update:modelValue', v),
 })
 
+// 连接串按引擎给：PG 必须带库名（默认 postgres 维护库），MySQL 可以不指定
+const isPostgres = computed(() => conn.value?.engine === 'postgres')
+const isMongo = computed(() => conn.value?.engine === 'mongodb')
+const isMySQL = computed(() => !conn.value?.external && conn.value?.engine === 'mysql')
+const scheme = computed(() => (isPostgres.value ? 'postgresql' : isMongo.value ? 'mongodb' : 'mysql'))
+
 const extUrl = computed(() => {
   const c = conn.value
   if (!c) return ''
-  return `mysql://root:${encodeURIComponent(c.password)}@${c.host}:${c.port}/`
+  const db = isPostgres.value ? (c.database || 'postgres') : isMongo.value ? 'admin' : ''
+  const auth = isMongo.value ? '?authSource=admin' : ''
+  return `${scheme.value}://${c.user}:${encodeURIComponent(c.password)}@${c.host}:${c.port}/${db}${auth}`
 })
 
 const innerUrl = computed(() => {
   const c = conn.value
   if (!c) return ''
-  return `mysql://root:${encodeURIComponent(c.password)}@${c.containerHost ?? ''}:${c.containerPort ?? 3306}/`
+  const db = isPostgres.value ? (c.database || 'postgres') : isMongo.value ? 'admin' : ''
+  const port = c.containerPort ?? (isPostgres.value ? 5432 : isMongo.value ? 27017 : 3306)
+  const auth = isMongo.value ? '?authSource=admin' : ''
+  return `${scheme.value}://${c.user}:${encodeURIComponent(c.password)}@${c.containerHost ?? ''}:${port}/${db}${auth}`
 })
 
 async function load(): Promise<void> {
@@ -48,11 +59,13 @@ async function load(): Promise<void> {
     conn.value = c
     draftPwd.value = c.password
     showPwd.value = false
-    try {
-      const access = await api.getRootAccess(props.instanceId)
-      remote.value = access.remote
-    } catch (e) {
-      remoteError.value = errText(e)
+    if (props.canManage && !c.external && c.engine === 'mysql') {
+      try {
+        const access = await api.getRootAccess(props.instanceId)
+        remote.value = access.remote
+      } catch (e) {
+        remoteError.value = errText(e)
+      }
     }
   } catch (e) {
     error.value = errText(e)
@@ -140,7 +153,7 @@ watch(
       <el-alert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
       <template v-if="conn">
-        <section class="block">
+        <section v-if="!conn.external && conn.containerHost" class="block">
           <header class="block-head">
             <h3>容器连接</h3>
             <el-button link :icon="CopyDocument" @click="copy(innerUrl, '容器连接 URL')">
@@ -164,7 +177,7 @@ watch(
 
         <section class="block">
           <header class="block-head">
-            <h3>外部连接</h3>
+            <h3>{{ conn.external ? '数据库连接' : '外部连接' }}</h3>
             <el-button link :icon="CopyDocument" @click="copy(extUrl, '外部连接 URL')">
               复制连接 URL
             </el-button>
@@ -187,11 +200,18 @@ watch(
             </div>
           </div>
           <p class="hint">
-            {{ conn.running ? '局域网里的客户端（DBeaver / Navicat / 手机）用这个地址。' : '服务当前未运行，端口暂时连不上。' }}
+            {{
+              conn.external
+                ? '这是接入已有数据库时保存的连接地址。密码只对当前登录管理员可见。'
+                : conn.running
+                  ? '局域网里的客户端（DBeaver / Navicat / 手机）用这个地址。'
+                  : '服务当前未运行，端口暂时连不上。'
+            }}
           </p>
         </section>
 
-        <section class="block">
+        <!-- PostgreSQL 没有 root@host：来源由 pg_hba.conf 控制，默认就允许密码登录 -->
+        <section v-if="isMySQL && canManage" class="block">
           <header class="block-head">
             <h3>远程访问</h3>
             <el-switch
@@ -207,7 +227,7 @@ watch(
           </p>
         </section>
 
-        <section class="block">
+        <section v-if="isMySQL && canManage" class="block">
           <header class="block-head">
             <h3>root 密码</h3>
           </header>

@@ -45,17 +45,27 @@ export interface DiagReport {
 export interface HealthInfo {
   status: string
   version: string
-  /** 固定为 mysql：这一版本只做 MySQL */
+  /** 主引擎（mysql）；完整清单看 engines */
   engine: string
+  /** 支持的引擎清单：mysql / postgres */
+  engines?: string[]
   instances: number
   platform: boolean
   /** Docker 是否可用：不可用时部署按钮要能说明原因 */
   docker: boolean
 }
 
-/** 引擎展示名。只有一个引擎，保留常量是为了页面统一取名字。 */
+/** 引擎展示名：台账里的 engine 值 → 界面上显示的名字。 */
 export const ENGINE_LABEL: Record<string, string> = {
   mysql: 'MySQL',
+  postgres: 'PostgreSQL',
+  mongodb: 'MongoDB',
+}
+
+/** 取引擎展示名；老数据没有 engine 时按 MySQL 显示。 */
+export function engineLabel(engine?: string): string {
+  if (!engine) return ENGINE_LABEL.mysql
+  return ENGINE_LABEL[engine] ?? engine
 }
 
 export interface Instance {
@@ -63,6 +73,13 @@ export interface Instance {
   name: string
   engine: string
   engineVersion: string
+  /** managed：本应用创建的 Docker 服务；external：用户已有数据库 */
+  mode: 'managed' | 'external'
+  host?: string
+  username?: string
+  tlsMode?: 'disable' | 'require'
+  /** 实际拉取/运行的镜像地址（含加速站或私有仓库前缀） */
+  image?: string
   status: string
   statusReason?: string
   dataDir: string
@@ -87,18 +104,40 @@ export interface Instance {
   /** 备份份数与最近一次备份时间（概览等聚合接口可能不带） */
   backupCount?: number
   lastBackupAt?: number
+  /** 后端按服务类型给出的页面能力，前端不要自己按引擎猜 */
+  capabilities: InstanceCapabilities
+  accessRole: 'viewer' | 'operator' | 'admin'
+}
+
+export interface InstanceCapabilities {
+  startStop: boolean
+  container: boolean
+  config: boolean
+  configFile: boolean
+  backup: boolean
+  users: boolean
+  databases: boolean
+  transfer: boolean
+  testConnection: boolean
+  revealRoot: boolean
+  deletePermanent: boolean
+  members: boolean
 }
 
 /** 连接信息给的是 root 入口账号：一个服务下可有多个库，所以不带"库名" */
 export interface ConnectionInfo {
   engine: string
   version: string
+  /** 外部连接为 true，界面不显示容器地址与 root 管理 */
+  external?: boolean
   host: string
   port: number
   /** 容器内地址：同一 Docker 网络里的应用用它连 */
   containerHost?: string
   containerPort?: number
   user: string
+  /** PG 连接必须指定库，默认给 postgres 维护库；MySQL 为空 */
+  database?: string
   password: string
   running: boolean
 }
@@ -120,6 +159,11 @@ export interface BackupRecord {
   errorHint?: string
 }
 
+export interface BackupWithInstance extends BackupRecord {
+  instanceName: string
+  engine: string
+}
+
 export interface AuditRecord {
   id: number
   ts: number
@@ -133,7 +177,7 @@ export interface AuditRecord {
 }
 
 /**
- * 配置项。两种引擎的可调项完全不同（PG 是 postgresql.conf，SQLite 是 PRAGMA），
+ * 配置项。不同引擎的可调项与生效方式不同（例如 PG 走 ALTER SYSTEM），
  * 但形状一致：后端给什么就渲染什么，前端不预设某个引擎有哪些参数。
  */
 export interface ConfigItem {
@@ -158,6 +202,8 @@ export interface InstanceConfig {
 export interface ConfigResult {
   needRestart: boolean
   message: string
+  /** PostgreSQL 写完配置后 pg_file_settings 报出的解析错误（行/参数/原因） */
+  warnings?: string[]
 }
 
 /** 一套按内存档位算好的参数组合 */
@@ -198,12 +244,21 @@ export interface DbUser {
   grants?: RoleGrant[]
 }
 
+export interface InstanceMember {
+  instanceId: string
+  userId: string
+  username: string
+  role: 'viewer' | 'operator' | 'admin'
+  createdAt: number
+  updatedAt: number
+}
+
 /** 可部署的镜像版本：tag 即版本，本地有没有实时问 docker。 */
 export interface ImageInfo {
   tag: string
   /** 完整镜像名，例如 mysql:8.4 */
   name: string
-  /** mysql / mariadb */
+  /** mysql / mariadb / postgres */
   family: string
   label: string
   note?: string
@@ -217,11 +272,38 @@ export interface ImageInfo {
   usedBy: string[]
 }
 
+/** 配置文件页的可选文件（MySQL 只有一份，PG 有三份）。 */
+export interface ConfigFileMeta {
+  name: string
+  label: string
+  writable: boolean
+  note?: string
+}
+
+export interface ConfigFileData {
+  path: string
+  content: string
+  backupExists: boolean
+  suggested?: string
+  missing?: string[]
+  files?: ConfigFileMeta[]
+  selected?: string
+  /** 读不到时的原因（服务未运行、文件在卷里等），仍会返回文件清单 */
+  readError?: string
+  running?: boolean
+}
+
+function queryName(name?: string): string {
+  return name ? `?name=${encodeURIComponent(name)}` : ''
+}
+
 export interface ImageList {
   items: ImageInfo[]
   total: number
   dockerOk: boolean
   arch: string
+  /** 镜像加速站前缀（NIUDBM_DOCKER_MIRROR），可能为空 */
+  dockerMirror?: string
 }
 
 export interface PortStatus {
@@ -253,6 +335,36 @@ interface Envelope<T> {
   message: string
   data: T
   traceId: string
+}
+
+/* ---------- 登录 ---------- */
+
+/** 登录的人：身份来自 NAS，账号不是牛库管家自己建的。 */
+export interface AuthUser {
+  uid: string
+  username: string
+  isAdmin: boolean
+}
+
+/**
+ * 这次请求自带的飞牛身份。
+ * available=false 时 reason 会说明原因（直接访问端口、刷新过页面等），登录页据此解释。
+ */
+export interface AuthGateway {
+  available: boolean
+  uid?: string
+  username?: string
+  isAdmin: boolean
+  reason?: string
+}
+
+export interface AuthState {
+  authenticated: boolean
+  user?: AuthUser
+  gateway: AuthGateway
+  platform: boolean
+  /** 开发模式（直接 go run / vite dev）：没有网关，身份按 dev 管理员放行 */
+  dev: boolean
 }
 
 /** 后端统一响应包里的非 0 code 会转成这个错误，页面直接展示 message。 */
@@ -299,10 +411,16 @@ async function send<T>(path: string, init: RequestInit): Promise<T> {
     throw new ApiError(hint, res.status)
   }
   if (!res.ok || env.code !== 0) {
+    // 会话过期/被注销时统一广播一次：App 收到就回到登录页，
+    // 而不是让每个页面各自处理一遍「这次失败是不是因为没登录」。
+    if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
     throw new ApiError(env.message || `请求失败（HTTP ${res.status}）`, env.code, env.traceId)
   }
   return env.data
 }
+
+/** 未登录/会话失效时广播的事件名。 */
+export const UNAUTHORIZED_EVENT = 'niudbm:unauthorized'
 
 async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
@@ -344,10 +462,12 @@ export interface CreateUserInput {
 
 export interface CreateInstanceInput {
   name: string
-  /** 只有 mysql；留空即 MySQL */
+  /** mysql / postgres；留空即 MySQL */
   engine?: string
-  /** 镜像 tag（8.4 / 8.0 / 11.4）；留空用默认 LTS */
+  /** 镜像 tag（8.4 / 8.0 / 11.4 / 17）；留空用默认版本 */
   engineVersion?: string
+  /** 完整镜像地址（可含加速站或私有仓库，必须带标签）；留空用清单地址 */
+  image?: string
   profile?: string
   seedSql?: string
   note?: string
@@ -365,6 +485,17 @@ export interface CreateInstanceInput {
   storagePath?: string
   /** 指定监听端口；留空（0）由服务端从端口池自动分配 */
   port?: number
+}
+
+export interface ConnectInstanceInput {
+  name: string
+  engine: 'mysql' | 'postgres' | 'mongodb'
+  engineVersion?: string
+  host: string
+  port: number
+  username: string
+  password: string
+  tlsMode: 'disable' | 'require'
 }
 
 /** 部署常驻服务是异步的：POST 先回 taskId，前端轮询阶段。 */
@@ -475,15 +606,30 @@ export interface BackupPolicy {
 }
 
 export const api = {
+  // 登录：身份由飞牛统一网关提供，应用不建账号、不存密码
+  authState: () => request<AuthState>('/auth/state'),
+  authLogin: () => request<{ user: AuthUser; expiresAt: number }>('/auth/login', 'POST'),
+  authLogout: () => request<{ ok: boolean }>('/auth/logout', 'POST'),
+  authMe: () => request<AuthUser>('/auth/me'),
+
   diag: () => request<DiagReport>('/diag'),
   health: () => request<HealthInfo>('/health'),
 
   listInstances: (q = '') =>
     request<{ items: Instance[]; total: number }>(`/instances${qs({ q })}`),
   getInstance: (id: string) => request<Instance>(`/instances/${id}`),
-  // SQLite 同步返回实例；MySQL / PostgreSQL 返回 { taskId }，需轮询 deployTask
+  listMembers: (id: string) =>
+    request<{ items: InstanceMember[]; total: number }>(`/instances/${id}/members`),
+  upsertMember: (id: string, userId: string, username: string, role: InstanceMember['role']) =>
+    request<InstanceMember>(`/instances/${id}/members/${encodeURIComponent(userId)}`, 'PUT', { username, role }),
+  deleteMember: (id: string, userId: string) =>
+    request<{ userId: string }>(`/instances/${id}/members/${encodeURIComponent(userId)}`, 'DELETE'),
+  // MySQL / PostgreSQL / MongoDB 返回 { taskId }，需轮询 deployTask
   createInstance: (input: CreateInstanceInput) =>
     request<Instance | { taskId: string; name: string; async: true }>('/instances', 'POST', input),
+  connectInstance: (input: ConnectInstanceInput) => request<Instance>('/instances/connect', 'POST', input),
+  testConnection: (id: string) =>
+    request<{ connected: boolean; message: string }>(`/instances/${id}/test-connection`, 'POST'),
   deployTask: (taskId: string) => request<DeployTask>(`/deploy-tasks/${taskId}`),
   /** 部署现场：失败时后端把容器日志固化到实例目录，这里原样取回 */
   deployLog: (id: string) =>
@@ -545,15 +691,15 @@ export const api = {
   // 镜像管理：版本就是镜像 tag，本地状态实时问 docker
   listImages: () => request<ImageList>('/images'),
   // 立即拉取：本地没有时返回 jobId，前端轮询 /jobs/{id}
-  pullImage: (tag: string) =>
+  pullImage: (tag: string, family: string) =>
     request<{ async?: boolean; jobId?: string; image: string; cached?: boolean; message?: string }>(
       '/images/pull',
       'POST',
-      { tag },
+      { tag, family },
     ),
   // 删除本地镜像：有服务在用时后端 409，并点名是谁
-  deleteImage: (tag: string) =>
-    request<{ message: string }>(`/images/${encodeURIComponent(tag)}`, 'DELETE'),
+  deleteImage: (tag: string, family: string) =>
+    request<{ message: string }>(`/images/${encodeURIComponent(tag)}${qs({ family })}`, 'DELETE'),
   preflight: () => request<PreflightResult>('/preflight'),
 
   startInstance: (id: string) => request<{ id: string; status: string }>(`/instances/${id}/start`, 'POST'),
@@ -570,18 +716,13 @@ export const api = {
     request<{ message: string }>(`/instances/${id}/root-password`, 'PUT', { password }),
   // 配置文件原文：白名单之外的参数从这里写，保存后需重启
   // suggested 是一份"应有的默认配置"文本（不落盘），missing 是当前文件缺少的可配置项
-  getConfigFile: (id: string) =>
-    request<{
-      path: string
-      content: string
-      backupExists: boolean
-      suggested: string
-      missing: string[]
-    }>(`/instances/${id}/config/file`),
-  putConfigFile: (id: string, content: string) =>
-    request<ConfigResult>(`/instances/${id}/config/file`, 'PUT', { content }),
-  restoreConfigFile: (id: string) =>
-    request<ConfigResult>(`/instances/${id}/config/file/restore`, 'POST'),
+  // name 只在 PostgreSQL 下有意义（postgresql.conf / pg_hba.conf / postgresql.auto.conf）
+  getConfigFile: (id: string, name?: string) =>
+    request<ConfigFileData>(`/instances/${id}/config/file${queryName(name)}`),
+  putConfigFile: (id: string, content: string, name?: string) =>
+    request<ConfigResult>(`/instances/${id}/config/file${queryName(name)}`, 'PUT', { content }),
+  restoreConfigFile: (id: string, name?: string) =>
+    request<ConfigResult>(`/instances/${id}/config/file/restore${queryName(name)}`, 'POST'),
 
   // 一个数据库服务里的多个实例（逻辑库）
   listDatabases: (id: string) =>
@@ -606,6 +747,7 @@ export const api = {
 
   listBackups: (id: string) =>
     request<{ items: BackupRecord[]; total: number; backupRoot: string }>(`/instances/${id}/backups`),
+  listBackupCenter: () => request<{ items: BackupWithInstance[]; total: number }>('/backups'),
   createBackup: (id: string, note: string, database?: string) =>
     request<BackupRecord>(`/instances/${id}/backups`, 'POST', { note, database }),
   restoreBackup: (id: string, bid: string, confirmName: string) =>
@@ -647,7 +789,7 @@ export interface OverviewImage {
   tag: string
   name: string
   label: string
-  /** mysql / mariadb */
+  /** mysql / mariadb / postgres */
   family: string
   local: boolean
   dockerOk: boolean

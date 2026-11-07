@@ -8,12 +8,13 @@ import (
 	"niudbm/server/internal/ulid"
 )
 
-// 错误码分段与《数据模型与接口契约》§5.2 保持一致；新增值只追加，不复用。
+// 接口错误码分段；新增值只追加，不复用。
 const (
 	codeOK = 0
 
 	codeBadRequest   = 10001
 	codeUnauthorized = 10002
+	codeForbidden    = 10003
 	codeNotFound     = 10004
 
 	codeInstanceNotFound = 20001

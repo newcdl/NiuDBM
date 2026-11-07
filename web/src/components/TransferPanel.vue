@@ -245,8 +245,7 @@ watch(targetDB, (next, prev) => {
           <p class="tip">
             支持适配当前引擎的普通 SQL 脚本。语句按顺序执行；失败时先前成功的语句不保证整体回滚，请先备份。
             <template v-if="engine === 'postgres'">不支持 psql 元命令、COPY FROM stdin 或自定义格式备份文件。</template>
-            <template v-else-if="engine === 'mysql'">不支持 mysql 客户端元命令（source、delimiter 等）。</template>
-            <template v-else> SQLite 还禁止 ATTACH、load_extension 等能越出当前文件的语句。</template>
+            <template v-else>不支持 mysql 客户端元命令（source、delimiter 等）。</template>
           </p>
           <div class="field">
             <div class="row head">

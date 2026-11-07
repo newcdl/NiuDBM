@@ -74,7 +74,8 @@ for f in "${APP_DIR}"/cmd/* "${ROOT}"/scripts/*.sh; do
 done
 
 if command -v python3 >/dev/null 2>&1; then
-  for f in "$APP_DIR"/config/* "$APP_DIR"/app/ui/config; do
+  # 向导文件是 JSON（无扩展名）；写坏了 fnpack 不报错，真机上卸载时才炸
+  for f in "$APP_DIR"/config/* "$APP_DIR"/app/ui/config "$APP_DIR"/wizard/*; do
     [ -f "$f" ] || continue
     if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$f" 2>/dev/null; then
       ok "JSON $(basename "$(dirname "$f")")/$(basename "$f")"
@@ -141,10 +142,18 @@ fi
 echo "== 2. 前端构建 =="
 if [ "$SKIP_WEB" -eq 1 ]; then
   skip "--skip-web 已指定"
+elif [ -x "$WEB_DIR/node_modules/.bin/vue-tsc" ] && [ -x "$WEB_DIR/node_modules/.bin/vite" ]; then
+  # 本地已有锁定依赖时直接调用可执行文件，避免 pnpm 在无 TTY 环境下尝试重装。
+  if ( cd "$WEB_DIR" && ./node_modules/.bin/vue-tsc --noEmit && ./node_modules/.bin/vite build >/dev/null ); then
+    ok "前端产物已更新（本地依赖）"
+  else
+    echo "  [fail] 前端构建失败" >&2
+    exit 1
+  fi
 elif ! command -v pnpm >/dev/null 2>&1; then
-  echo "  [fail] 未安装 pnpm，无法构建前端" >&2
+  echo "  [fail] 未安装 pnpm，且项目没有可用的 node_modules" >&2
   exit 1
-elif ( cd "$WEB_DIR" && pnpm install --silent && pnpm build >/dev/null ); then
+elif ( cd "$WEB_DIR" && CI=true pnpm install --silent && pnpm build >/dev/null ); then
   ok "前端产物已更新"
 else
   echo "  [fail] 前端构建失败" >&2

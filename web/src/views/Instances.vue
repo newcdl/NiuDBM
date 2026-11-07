@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { api, type Instance } from '../api'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { api, engineLabel, type Instance } from '../api'
 import { errText, formatBytes, formatTime } from '../format'
 import InstanceDetail from './InstanceDetail.vue'
 import Modal from '../components/Modal.vue'
@@ -9,31 +9,31 @@ import Pager from '../components/Pager.vue'
 import { usePager } from '../pager'
 import { isCardView } from '../view-mode'
 import EngineTabs from '../components/EngineTabs.vue'
-import type { Engine } from '../components/EngineTabs.vue'
+import ConnectDatabase from '../components/ConnectDatabase.vue'
+import { tabEngine, type Engine } from '../engine'
+import { useAuth } from '../auth'
 
 // 账号并进了「数据库与账号」页签，这里不再有单独的 users
-type TabKey = 'overview' | 'databases' | 'config' | 'backups' | 'transfer' | 'danger'
+type TabKey = 'overview' | 'databases' | 'config' | 'cnf' | 'backups' | 'transfer' | 'members' | 'danger'
 
-const props = defineProps<{ notice?: { id: string; name: string; port: number } | null }>()
-const emit = defineEmits<{ navigate: [view: 'jobs' | 'deploy' | 'images', version?: string] }>()
+const props = defineProps<{
+  notice?: { id: string; name: string; port: number } | null
+  // 部署完成后要落到对应引擎的页签：否则刚建好的 PG 服务会被"只显示 MySQL"
+  // 的过滤挡在外面，看起来就像什么都没发生
+  initialEngine?: Engine
+  initialId?: string
+  initialTab?: string
+}>()
+const emit = defineEmits<{
+  navigate: [view: 'jobs' | 'deploy' | 'images', version?: string, engine?: string]
+  open: [id: string, tab?: string]
+  'tab-change': [id: string, tab: string]
+  back: []
+}>()
 
-// 引擎页签：只有 MySQL 是通的，另外两个先占位，让"以后会支持什么"有落点
-const engine = ref<Engine>('mysql')
-
-const WIP: Record<string, { title: string; intro: string; plans: string[] }> = {
-  postgresql: {
-    title: 'PostgreSQL 还在做',
-    intro: '会复用同一套部署、备份、导入导出与账号管理流程，底层换成 psql / pg_dump。',
-    plans: ['部署与版本管理（含 ARM 架构的官方镜像）', '库表浏览与 SQL 查询', '账号与库级授权', '逻辑备份恢复与 CSV 导入导出'],
-  },
-  mongodb: {
-    title: 'MongoDB 还在做',
-    intro: 'MongoDB 不是关系型数据库，账号、备份、导入导出都会单独做一套，不会硬套 MySQL 的模型。',
-    plans: ['单机与副本集部署', '集合浏览与文档查询', '基于角色的用户管理', 'mongodump / mongorestore 备份恢复'],
-  },
-}
-
-const wip = computed(() => WIP[engine.value] ?? WIP.postgresql)
+// 引擎页签：三个引擎都走统一的数据源模型。
+const engine = ref<Engine>(props.initialEngine ?? 'mysql')
+const engineKey = computed(() => tabEngine(engine.value))
 
 const PROFILE_TEXT: Record<string, string> = {
   low: '轻量',
@@ -54,19 +54,25 @@ const STATUS_TEXT: Record<string, string> = {
 
 const items = ref<Instance[]>([])
 
+// 按引擎过滤：接口一次返回全部服务，页签只决定"现在看哪种"
+const shown = computed(() => items.value.filter((it) => (it.engine || 'mysql') === engineKey.value))
+
 // 服务列表分页：NAS 上装了十几个服务之后，一屏铺下来就找不到重点了
 const {
   page: pageNo,
   pageSize,
   total: pageTotal,
   items: pagedItems,
-} = usePager(items, 10)
+} = usePager(shown, 10)
 const loading = ref(false)
 const error = ref('')
 const keyword = ref('')
+const connectOpen = ref(false)
+const { state: authState } = useAuth()
+const canCreate = computed(() => authState.value?.user?.isAdmin === true)
 
-const selectedID = ref('')
-const detailTab = ref<TabKey>('overview')
+const selectedID = ref(props.initialId ?? '')
+const detailTab = ref<TabKey>((props.initialTab as TabKey) || 'overview')
 
 const toggling = ref('')
 const justDeployed = computed(() => props.notice ?? null)
@@ -77,14 +83,36 @@ function statusClass(status: string): string {
   return 'pill-warn'
 }
 
+function displayStatus(it: Instance): string {
+  if (it.mode === 'external') {
+    if (it.status === 'running') return '已连接'
+    if (it.status === 'error') return '连接失败'
+    return '待连接'
+  }
+  return STATUS_TEXT[it.status] ?? it.status
+}
+
+function statusClassOf(it: Instance): string {
+  if (it.mode === 'external') return it.status === 'running' ? 'pill-ok' : 'pill-bad'
+  return statusClass(it.status)
+}
+
+function canOperate(it: Instance): boolean {
+  return it.accessRole === 'operator' || it.accessRole === 'admin'
+}
+
+function canAdmin(it: Instance): boolean {
+  return it.accessRole === 'admin'
+}
+
 // 创建中/部署失败的实例没有可用服务：点进详情只会看到一堆取不到数据的报错，
 // 这类行改成展示原因 + 日志入口，别让用户白点。
 function isUnusable(it: Instance): boolean {
   return it.status === 'creating' || it.status === 'failed'
 }
 
-const running = computed(() => items.value.filter((it) => it.status === 'running'))
-const totalSize = computed(() => items.value.reduce((sum, it) => sum + (it.sizeBytes || 0), 0))
+const running = computed(() => shown.value.filter((it) => it.status === 'running'))
+const totalSize = computed(() => shown.value.reduce((sum, it) => sum + (it.sizeBytes || 0), 0))
 const runningPorts = computed(() => running.value.map((it) => it.port).filter((p): p is number => !!p))
 
 async function load(): Promise<void> {
@@ -187,6 +215,12 @@ async function confirmRemove(): Promise<void> {
 function openDetail(id: string, tab: TabKey = 'overview'): void {
   selectedID.value = id
   detailTab.value = tab
+  emit('open', id, tab)
+}
+
+function onDetailTab(tab: TabKey): void {
+  detailTab.value = tab
+  if (selectedID.value) emit('tab-change', selectedID.value, tab)
 }
 
 async function toggleRun(it: Instance): Promise<void> {
@@ -207,8 +241,29 @@ async function toggleRun(it: Instance): Promise<void> {
 }
 
 function openDeploy(version?: string): void {
-  emit('navigate', 'deploy', version)
+  emit('navigate', 'deploy', version, engineKey.value)
 }
+
+function onConnected(instance: Instance): void {
+  connectOpen.value = false
+  void load().then(() => openDetail(instance.id))
+}
+
+// 再进页面时跟随外部指定（从部署页回来、从概览跳转），避免停在旧页签
+watch(
+  () => props.initialEngine,
+  (next) => {
+    if (next) engine.value = next
+  },
+)
+
+watch(
+  () => [props.initialId, props.initialTab] as const,
+  ([id, tab]) => {
+    selectedID.value = id ?? ''
+    if (tab) detailTab.value = tab as TabKey
+  },
+)
 
 onMounted(load)
 onBeforeUnmount(() => {
@@ -221,20 +276,18 @@ onBeforeUnmount(() => {
     v-if="selectedID"
     :instance-id="selectedID"
     :initial-tab="detailTab"
-    @back="selectedID = ''; load()"
+    @back="selectedID = ''; load(); emit('back')"
+    @route="onDetailTab"
     @changed="load()"
   />
 
   <div v-else class="page">
     <EngineTabs v-model="engine" />
 
-    <template v-if="engine === 'mysql'">
       <header class="head">
       <div>
         <h2>数据库服务</h2>
-        <p class="muted">
-          一个服务就是一个 MySQL 容器：独立端口、独立数据。点进去才能建数据库、发账号。
-        </p>
+        <p class="muted">管理本应用创建的 {{ engineLabel(engineKey) }} 服务，也可以接入已有数据库。</p>
       </div>
       <div class="row">
         <input
@@ -248,7 +301,8 @@ onBeforeUnmount(() => {
         <button type="button" class="btn" :disabled="loading" @click="load()">
           {{ loading ? '读取中' : '刷新' }}
         </button>
-        <button type="button" class="btn btn-primary" @click="openDeploy()">部署服务</button>
+        <button v-if="canCreate" type="button" class="btn" @click="connectOpen = true">连接已有</button>
+        <button v-if="canCreate" type="button" class="btn btn-primary" @click="openDeploy()">创建托管服务</button>
       </div>
     </header>
 
@@ -278,10 +332,14 @@ onBeforeUnmount(() => {
               {{ it.name }}
             </button>
             <span v-else class="name strong">{{ it.name }}</span>
-            <span class="sub">MySQL {{ it.engineVersion }} · {{ PROFILE_TEXT[it.profile] ?? it.profile }}</span>
+            <span class="sub">
+              {{ engineLabel(it.engine) }} {{ it.engineVersion }} ·
+              {{ it.mode === 'external' ? '外部连接' : (PROFILE_TEXT[it.profile] ?? it.profile) }}
+              <template v-if="it.mode === 'external'"> · {{ it.host }}:{{ it.port }}</template>
+            </span>
           </div>
-          <span class="pill" :class="statusClass(it.status)" :title="it.statusReason || ''">
-            {{ STATUS_TEXT[it.status] ?? it.status }}
+          <span class="pill" :class="statusClassOf(it)" :title="it.statusReason || ''">
+            {{ displayStatus(it) }}
           </span>
         </header>
 
@@ -301,7 +359,8 @@ onBeforeUnmount(() => {
           <div>
             <dt>体积</dt>
             <dd>
-              <span v-if="it.sizeUnknown" class="muted" title="数据在 docker 卷里，宿主读不到体积">卷内</span>
+              <span v-if="it.mode === 'external'" class="muted" title="外部数据库的容量由数据库自身统计">外部库</span>
+              <span v-else-if="it.sizeUnknown" class="muted" title="数据在 docker 卷里，宿主读不到体积">卷内</span>
               <span v-else>{{ formatBytes(it.sizeBytes || 0) }}</span>
             </dd>
           </div>
@@ -323,16 +382,16 @@ onBeforeUnmount(() => {
           </template>
           <template v-else-if="it.status === 'failed'">
             <button type="button" class="btn btn-sm" @click="openDeployLog(it)">部署日志</button>
-            <button type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
+            <button v-if="canAdmin(it)" type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
           </template>
           <template v-else>
             <button type="button" class="btn btn-sm" @click="openDetail(it.id)">管理</button>
             <button type="button" class="btn btn-sm" @click="openDetail(it.id, 'databases')">库与账号</button>
-            <button type="button" class="btn btn-sm" @click="openDetail(it.id, 'config')">配置</button>
-            <button type="button" class="btn btn-sm" :disabled="toggling === it.id" @click="toggleRun(it)">
+            <button v-if="it.capabilities.config && canOperate(it)" type="button" class="btn btn-sm" @click="openDetail(it.id, 'config')">配置</button>
+            <button v-if="it.capabilities.startStop && canOperate(it)" type="button" class="btn btn-sm" :disabled="toggling === it.id" @click="toggleRun(it)">
               {{ toggling === it.id ? '…' : it.status === 'running' ? '停止' : '启动' }}
             </button>
-            <button type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
+            <button v-if="canAdmin(it)" type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
           </template>
         </div>
       </article>
@@ -358,12 +417,12 @@ onBeforeUnmount(() => {
                 {{ it.name }}
               </button>
               <span v-else class="strong">{{ it.name }}</span>
-              <div class="sub">{{ PROFILE_TEXT[it.profile] ?? it.profile }}</div>
+              <div class="sub">{{ it.mode === 'external' ? `外部连接 · ${it.host}:${it.port}` : (PROFILE_TEXT[it.profile] ?? it.profile) }}</div>
             </td>
             <td class="mono">{{ it.engineVersion }}</td>
             <td>
-              <span class="pill" :class="statusClass(it.status)" :title="it.statusReason || ''">
-                {{ STATUS_TEXT[it.status] ?? it.status }}
+              <span class="pill" :class="statusClassOf(it)" :title="it.statusReason || ''">
+                {{ displayStatus(it) }}
               </span>
               <div v-if="it.status === 'failed' && it.statusReason" class="sub reason" :title="it.statusReason">
                 {{ it.statusReason }}
@@ -372,7 +431,8 @@ onBeforeUnmount(() => {
             <td class="mono">{{ it.port || '—' }}</td>
             <td>{{ it.tableCount ?? '—' }}</td>
             <td>
-              <span v-if="it.sizeUnknown" class="muted" title="数据在 docker 卷里，宿主读不到体积">卷内</span>
+              <span v-if="it.mode === 'external'" class="muted">外部库</span>
+              <span v-else-if="it.sizeUnknown" class="muted" title="数据在 docker 卷里，宿主读不到体积">卷内</span>
               <span v-else>{{ formatBytes(it.sizeBytes || 0) }}</span>
             </td>
             <td>
@@ -387,16 +447,16 @@ onBeforeUnmount(() => {
               </template>
               <template v-else-if="it.status === 'failed'">
                 <button type="button" class="btn btn-sm" @click="openDeployLog(it)">部署日志</button>
-                <button type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
+                <button v-if="canAdmin(it)" type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
               </template>
               <template v-else>
                 <button type="button" class="btn btn-sm" @click="openDetail(it.id)">管理</button>
                 <button type="button" class="btn btn-sm" @click="openDetail(it.id, 'databases')">库与账号</button>
-                <button type="button" class="btn btn-sm" @click="openDetail(it.id, 'config')">配置</button>
-                <button type="button" class="btn btn-sm" :disabled="toggling === it.id" @click="toggleRun(it)">
+                <button v-if="it.capabilities.config && canOperate(it)" type="button" class="btn btn-sm" @click="openDetail(it.id, 'config')">配置</button>
+                <button v-if="it.capabilities.startStop && canOperate(it)" type="button" class="btn btn-sm" :disabled="toggling === it.id" @click="toggleRun(it)">
                   {{ toggling === it.id ? '…' : it.status === 'running' ? '停止' : '启动' }}
                 </button>
-                <button type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
+                <button v-if="canAdmin(it)" type="button" class="btn btn-sm" @click="askRemove(it)">删除</button>
               </template>
             </td>
           </tr>
@@ -407,13 +467,29 @@ onBeforeUnmount(() => {
     <Pager v-model:page="pageNo" v-model:page-size="pageSize" :total="pageTotal" />
 
     <p v-if="!items.length && !loading" class="card empty">
-      还没有服务。点右上角「部署服务」建第一个 MySQL。
+      {{
+        canCreate
+          ? `还没有数据库服务。可以连接已有 ${engineLabel(engineKey)}，或创建一个由本应用托管的服务。`
+          : '还没有被授权访问的数据库服务，请联系 NAS 管理员添加成员权限。'
+      }}
     </p>
+
+    <ConnectDatabase
+      v-if="connectOpen"
+      :initial-engine="engine"
+      @close="connectOpen = false"
+      @connected="onConnected"
+    />
 
     <!-- 删除确认：容器一定会被删，数据是否一起清掉由用户决定 -->
     <Modal v-if="removing" :title="`删除服务 · ${removing.inst.name}`" :busy="removing.busy" @close="removing = null">
       <p class="tip">
-        容器会被删除，端口随之释放。数据默认保留，之后仍可在宿主机上找到。
+        <template v-if="removing.inst.mode === 'external'">
+          只会移除本应用中的连接记录与保存的凭据，不会删除或修改外部数据库。
+        </template>
+        <template v-else>
+          容器会被删除，端口随之释放。数据默认保留，之后仍可在宿主机上找到。
+        </template>
       </p>
       <dl class="facts-list">
         <div>
@@ -425,7 +501,7 @@ onBeforeUnmount(() => {
           <dd>{{ removing.inst.sizeUnknown ? '未知（docker 卷）' : formatBytes(removing.inst.sizeBytes || 0) }}</dd>
         </div>
       </dl>
-      <label class="check">
+      <label v-if="removing.inst.mode !== 'external'" class="check">
         <input v-model="removing.purge" type="checkbox" />
         <span>同时删除数据（不可恢复；docker 卷会被移除，应用自己管理的目录会移入回收站）</span>
       </label>
@@ -473,19 +549,6 @@ onBeforeUnmount(() => {
         </button>
       </template>
     </Modal>
-    </template>
-
-    <section v-else class="wip-panel">
-      <div class="wip-head">
-        <h3>{{ wip.title }}</h3>
-        <span class="pill pill-warn">开发中</span>
-      </div>
-      <p class="muted">{{ wip.intro }}</p>
-      <ul class="wip-list">
-        <li v-for="p in wip.plans" :key="p">{{ p }}</li>
-      </ul>
-      <p class="muted small">现在先用 MySQL：部署、备份、导入导出、账号管理都是通的。</p>
-    </section>
   </div>
 </template>
 
@@ -777,41 +840,6 @@ onBeforeUnmount(() => {
 
 .check input {
   margin-top: 2px;
-}
-
-/* 引擎占位：PG / MongoDB 还没做，把计划写清楚，不要只留一片空白 */
-.wip-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 20px 22px;
-  border: 1px dashed var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-}
-
-.wip-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.wip-head h3 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.wip-panel p {
-  margin: 0;
-  line-height: 1.7;
-}
-
-.wip-list {
-  margin: 0;
-  padding-left: 20px;
-  color: var(--fg-muted);
-  font-size: 13.5px;
-  line-height: 1.9;
 }
 
 /* 手机：标题与操作各自一行，搜索框吃掉剩余宽度，服务卡片单列 */

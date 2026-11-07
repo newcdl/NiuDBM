@@ -1,0 +1,31 @@
+[
+  {
+    "stepTitle": "卸载牛库管家",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "默认只卸载程序，数据库实例、备份与凭据都保留在原处：重装之后原来的库还能直接接着用。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_keep_data",
+        "label": "数据处理",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留所有数据（推荐）",
+            "value": "keep"
+          },
+          {
+            "label": "删除所有数据，不可恢复",
+            "value": "delete"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "选「删除所有数据」会一并清掉：数据库实例目录、备份、root 密码等凭据、元数据库，以及本应用创建的 Docker 容器与数据卷。放到你自己共享文件夹里的备份不会被删除。"
+      }
+    ]
+  }
+]

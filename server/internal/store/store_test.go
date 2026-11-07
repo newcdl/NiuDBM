@@ -21,8 +21,8 @@ func newStore(t *testing.T) *Store {
 func sampleInstance(id, name string) Instance {
 	now := time.Now().UnixMilli()
 	return Instance{
-		ID: id, Name: name, Engine: "sqlite", Mode: "managed", Status: "running",
-		DataDir: filepath.ToSlash(filepath.Join(id, "data.db")), Profile: "low",
+		ID: id, Name: name, Engine: "mysql", Mode: "managed", Status: "running",
+		DataDir: filepath.ToSlash(filepath.Join(id, "mysql")), Profile: "low",
 		CreatedAt: now, UpdatedAt: now,
 	}
 }
@@ -65,7 +65,7 @@ func TestInstanceCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取失败：%v", err)
 	}
-	if got.Name != "博客库" || got.DataDir != "ID1/data.db" {
+	if got.Name != "博客库" || got.DataDir != "ID1/mysql" {
 		t.Fatalf("字段不符：%+v", got)
 	}
 
@@ -99,6 +99,33 @@ func TestInstanceCRUD(t *testing.T) {
 	// 删除后同名可以重新创建（台账内部把旧名改写掉了）
 	if err := s.CreateInstance(ctx, sampleInstance("ID2", "博客库2")); err != nil {
 		t.Fatalf("同名重建失败：%v", err)
+	}
+}
+
+func TestExternalInstancePersistsAndSurvivesLegacyCleanup(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	in := Instance{
+		ID: "EXT1", Name: "已有 MySQL", Engine: "mysql", EngineVersion: "8.0",
+		Mode: "external", Host: "192.168.1.20", Username: "dbadmin", TLSMode: "require",
+		Status: "running", Port: 3306, Runtime: "external", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateInstance(ctx, in); err != nil {
+		t.Fatalf("创建外部连接失败：%v", err)
+	}
+	got, err := s.GetInstance(ctx, "EXT1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != "external" || got.Host != "192.168.1.20" || got.Username != "dbadmin" || got.TLSMode != "require" {
+		t.Fatalf("外部连接字段未保存：%+v", got)
+	}
+	if n, err := s.HideLegacy(ctx); err != nil || n != 0 {
+		t.Fatalf("外部连接不应被老数据清理隐藏：n=%d err=%v", n, err)
+	}
+	if _, err := s.GetInstance(ctx, "EXT1"); err != nil {
+		t.Fatalf("外部连接应仍然可见：%v", err)
 	}
 }
 

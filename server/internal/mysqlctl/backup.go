@@ -20,6 +20,9 @@ import (
 // 备份要求实例处于运行态；原本停着的实例备份完会回到停止状态，
 // 用户感知不到状态变化。
 func (s Spec) Backup(dst, database string) error {
+	if s.External {
+		return errors.New("外部连接暂不支持由本应用备份，请使用数据库自身的备份方案")
+	}
 	database = strings.TrimSpace(database)
 	if database == "" {
 		return errors.New("请选择要备份的库")
@@ -112,8 +115,14 @@ func Verify(path string) error {
 	return nil
 }
 
+// VerifyBackup 让上层通过统一运行时接口校验备份。
+func (s Spec) VerifyBackup(path string) error { return Verify(path) }
+
 // Restore 用备份文件覆盖默认库；恢复后实例保持运行，由上层决定后续状态。
 func (s Spec) Restore(src string) error {
+	if s.External {
+		return errors.New("外部连接暂不支持由本应用恢复，请使用数据库自身的恢复方案")
+	}
 	if err := Verify(src); err != nil {
 		return err
 	}

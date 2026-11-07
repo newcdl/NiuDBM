@@ -14,11 +14,11 @@ import (
 // config 组装 DSN。容器里的库只能通过宿主机映射端口访问，
 // 管理连接也从 TCP 走；只监听 127.0.0.1 的映射由 docker 负责。
 func (s Spec) config(user, password, dbname string) mysql.Config {
-	return mysql.Config{
+	cfg := mysql.Config{
 		User:                 user,
 		Passwd:               password,
 		Net:                  "tcp",
-		Addr:                 fmt.Sprintf("127.0.0.1:%d", s.Port),
+		Addr:                 fmt.Sprintf("%s:%d", s.host(), s.Port),
 		DBName:               dbname,
 		AllowNativePasswords: true,
 		// Provision 阶段要一次执行整段初始化脚本，这里统一放开多语句；
@@ -26,6 +26,12 @@ func (s Spec) config(user, password, dbname string) mysql.Config {
 		MultiStatements: true,
 		Timeout:         5 * time.Second,
 	}
+	if s.External && s.TLSMode == "require" {
+		// 第一阶段只提供加密传输，不要求用户上传 CA。
+		// 界面上会明确写“加密但不校验证书”，避免把 skip-verify 说成完整 TLS。
+		cfg.TLSConfig = "skip-verify"
+	}
+	return cfg
 }
 
 // legacyAuth 判断要不要用 MySQL 5.7 之前的账号语法。
@@ -65,10 +71,10 @@ func (s Spec) openRoot() (*sql.DB, error) {
 
 // open 用管理账号连接指定库。
 func (s Spec) open(dbname string) (*sql.DB, error) {
-	if !s.Running() {
+	if !s.External && !s.Running() {
 		return nil, ErrNotRunning
 	}
-	cfg := s.config(SuperUser, s.Password, dbname)
+	cfg := s.config(s.adminUser(), s.Password, dbname)
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, err
@@ -80,6 +86,9 @@ func (s Spec) open(dbname string) (*sql.DB, error) {
 
 // ping 确认实例真的能接受查询。
 func (s Spec) ping() error {
+	if s.External {
+		return s.checkConnection()
+	}
 	db, err := s.openRoot()
 	if err != nil {
 		return err
@@ -88,6 +97,30 @@ func (s Spec) ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return db.PingContext(ctx)
+}
+
+func (s Spec) checkConnection() error {
+	cfg := s.config(s.adminUser(), s.Password, "")
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+// CheckConnection 验证外部连接参数是否可用。
+func (s Spec) CheckConnection() error {
+	if !s.External {
+		return errors.New("该服务不是外部连接")
+	}
+	return s.checkConnection()
 }
 
 // Provision 建管理账号、创建默认业务库，并在库里执行初始化脚本。

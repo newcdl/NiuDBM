@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"time"
 
+	"niudbm/server/internal/store"
 	"niudbm/server/internal/ulid"
 )
 
@@ -64,6 +66,12 @@ func (s *Server) startDeployTask(name, engine string) *deployTask {
 		}
 	}
 	s.deploys[t.ID] = t
+	if s.st != nil {
+		_ = s.st.CreateDeployTask(context.Background(), store.DeployTask{
+			ID: t.ID, Name: t.Name, Engine: t.Engine, Phase: t.Phase,
+			PhaseText: t.PhaseText, Status: t.Status, StartedAt: t.StartedAt,
+		})
+	}
 	return t
 }
 
@@ -73,6 +81,12 @@ func (s *Server) deployPhase(id, phase, text string) {
 	if t, ok := s.deploys[id]; ok {
 		t.Phase = phase
 		t.PhaseText = text
+		if s.st != nil {
+			_ = s.st.UpdateDeployTask(context.Background(), store.DeployTask{
+				ID: t.ID, Phase: t.Phase, PhaseText: t.PhaseText, Status: t.Status,
+				Error: t.Error, InstanceID: t.InstanceID, FinishedAt: t.FinishedAt,
+			})
+		}
 	}
 }
 
@@ -92,21 +106,46 @@ func (s *Server) deployDone(id, instanceID string, err error) {
 		t.Error = err.Error()
 		t.Phase = "failed"
 		t.PhaseText = "部署失败"
+		if s.st != nil {
+			_ = s.st.UpdateDeployTask(context.Background(), store.DeployTask{
+				ID: t.ID, Phase: t.Phase, PhaseText: t.PhaseText, Status: t.Status,
+				Error: t.Error, InstanceID: t.InstanceID, FinishedAt: t.FinishedAt,
+			})
+		}
 		return
 	}
 	t.Status = deployOK
 	t.Phase = "done"
 	t.PhaseText = "部署完成"
+	if s.st != nil {
+		_ = s.st.UpdateDeployTask(context.Background(), store.DeployTask{
+			ID: t.ID, Phase: t.Phase, PhaseText: t.PhaseText, Status: t.Status,
+			InstanceID: t.InstanceID, FinishedAt: t.FinishedAt,
+		})
+	}
 }
 
 func (s *Server) deploySnapshot(id string) (deployTask, bool) {
 	s.deployMu.Lock()
-	defer s.deployMu.Unlock()
 	t, ok := s.deploys[id]
-	if !ok {
+	if ok {
+		snapshot := *t
+		s.deployMu.Unlock()
+		return snapshot, true
+	}
+	s.deployMu.Unlock()
+	if s.st == nil {
 		return deployTask{}, false
 	}
-	return *t, true
+	saved, err := s.st.GetDeployTask(context.Background(), id)
+	if err != nil {
+		return deployTask{}, false
+	}
+	return deployTask{
+		ID: saved.ID, Name: saved.Name, Engine: saved.Engine, Phase: saved.Phase,
+		PhaseText: saved.PhaseText, Status: saved.Status, Error: saved.Error,
+		InstanceID: saved.InstanceID, StartedAt: saved.StartedAt, FinishedAt: saved.FinishedAt,
+	}, true
 }
 
 // handleGetDeployTask 供前端轮询部署进度。

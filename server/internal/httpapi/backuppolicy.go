@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"niudbm/server/internal/mysqlctl"
 	"niudbm/server/internal/store"
 )
 
@@ -87,6 +86,10 @@ func (s *Server) handleUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部连接暂不支持由本应用配置定时备份"))
 		return
 	}
 
@@ -303,7 +306,7 @@ func (s *Server) runPolicy(ctx context.Context, p store.BackupPolicy) {
 	var rec store.Backup
 	var backupErr error
 	var done []string
-	spec, specErr := s.mysqlSpec(in)
+	spec, specErr := s.dbSpec(in)
 	targets := []string{}
 	if specErr == nil {
 		if dbs, derr := spec.ListDatabases(); derr == nil {
@@ -425,10 +428,7 @@ func (s *Server) checkInstancesDown(ctx context.Context) {
 		return
 	}
 	for _, in := range list {
-		if in.Engine != mysqlctl.Engine {
-			continue
-		}
-		spec, rerr := s.mysqlSpec(in)
+		spec, rerr := s.dbSpec(in)
 		if rerr != nil {
 			continue
 		}

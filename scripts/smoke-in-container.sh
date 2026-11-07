@@ -82,22 +82,30 @@ for _ in $(seq 1 100); do
 done
 contains '"platform":false'
 contains '"engine":"mysql"'
+contains '"mongodb"'
 
 # 名字校验：路径分隔符、超长、空值都必须在动手部署之前拒掉
 curl -sS -X POST http://127.0.0.1:18780/api/v1/instances -H 'Content-Type: application/json' \
   -d '{"name":"a/b"}' -o response.json -w '%{http_code}' >dev.status
 [ "$(cat dev.status)" = 400 ] || die "非法名字应 400，实际 $(cat dev.status)：$(cat response.json)"
 
-# 非 MySQL 引擎明确拒绝，不能悄悄建一个 MySQL
+# 不认识的引擎明确拒绝，不能悄悄建一个 MySQL
+curl -sS -X POST http://127.0.0.1:18780/api/v1/instances -H 'Content-Type: application/json' \
+  -d '{"name":"lite","engine":"sqlite"}' -o response.json -w '%{http_code}' >dev.status
+[ "$(cat dev.status)" = 400 ] || die "sqlite 应 400，实际 $(cat dev.status)：$(cat response.json)"
+contains '不支持的引擎'
+
+# PostgreSQL 是支持的引擎：没有 Docker 时应卡在"要用 Docker"，而不是"不支持这个引擎"
 curl -sS -X POST http://127.0.0.1:18780/api/v1/instances -H 'Content-Type: application/json' \
   -d '{"name":"pg","engine":"postgres"}' -o response.json -w '%{http_code}' >dev.status
-[ "$(cat dev.status)" = 400 ] || die "postgres 应 400，实际 $(cat dev.status)：$(cat response.json)"
-contains '只支持 MySQL'
+[ "$(cat dev.status)" = 400 ] || die "无 Docker 时建 PG 应 400，实际 $(cat dev.status)：$(cat response.json)"
+contains 'Docker'
 
 # 镜像清单是版本唯一来源
 curl -fsS http://127.0.0.1:18780/api/v1/images -o response.json
 contains '"tag":"8.4"'
 contains '"name":"mysql:8.4"'
+contains '"family":"postgres"'
 contains '"family":"mysql"'
 cleanup
 PID=''
@@ -125,9 +133,16 @@ APP='http://localhost/app/niudbm'
 CURL=(curl -sS --max-time 600 --unix-socket "${SOCK}")
 ADMIN=(-H 'X-Trim-Userid: 1000' -H 'X-Trim-Username: admin' -H 'X-Trim-Isadmin: true')
 GUEST=(-H 'X-Trim-Userid: 1001' -H 'X-Trim-Username: guest' -H 'X-Trim-Isadmin: false')
+JAR="${WORK}/cookies.txt"
+
+# 身份头只用来换会话：先登录一次，之后所有请求都带 Cookie
+login_status="$("${CURL[@]}" "${ADMIN[@]}" -X POST "${APP}/api/v1/auth/login" -c "${JAR}" -o response.json -w '%{http_code}')"
+[ "${login_status}" = 200 ] || die "管理员登录应 200，实际 ${login_status}：$(cat response.json)"
+grep -qi 'niudbm_session' "${JAR}" || die '登录成功但没有下发会话 Cookie'
+
 req() {
   local expected="$1" method="$2" route="$3" body="${4:-}" mime="${5:-application/json}" status rc=''
-  status="$("${CURL[@]}" --connect-timeout 5 "${ADMIN[@]}" -X "${method}" "${APP}/api/v1${route}" \
+  status="$("${CURL[@]}" --connect-timeout 5 -b "${JAR}" -X "${method}" "${APP}/api/v1${route}" \
     -H "Content-Type: ${mime}" --data-binary "${body}" -o response.json -w '%{http_code}')" || rc=$?
   if [ -n "${rc}" ]; then
     die "${method} ${route} 请求没有完成（curl 退出码 ${rc}）：$(cat response.json 2>/dev/null)"
@@ -162,15 +177,27 @@ deploy() {
   first_field instanceId
 }
 
-# 身份与权限
+# 身份与权限：只认会话，Header 只用于登录
 "${CURL[@]}" "${GUEST[@]}" -o response.json -w '%{http_code}' "${APP}/api/v1/health" >guest.status
 [ "$(cat guest.status)" = 200 ] || die '普通用户读健康检查应 200'
-"${CURL[@]}" "${GUEST[@]}" -X PATCH "${APP}/api/v1/settings" -H 'Content-Type: application/json' \
-  -d '{}' -o response.json -w '%{http_code}' >guest.status
-[ "$(cat guest.status)" = 401 ] || die "普通用户写操作应 401，实际 $(cat guest.status)"
+GUESTJAR="${WORK}/guest-cookies.txt"
+"${CURL[@]}" "${GUEST[@]}" -X POST "${APP}/api/v1/auth/login" -c "${GUESTJAR}" -o response.json -w '%{http_code}' >guest.status
+[ "$(cat guest.status)" = 200 ] || die "普通成员登录应 200，实际 $(cat guest.status)"
+"${CURL[@]}" -b "${GUESTJAR}" -o response.json -w '%{http_code}' "${APP}/api/v1/settings" >guest.status
+[ "$(cat guest.status)" = 403 ] || die "普通成员读取全局设置应 403，实际 $(cat guest.status)"
 "${CURL[@]}" -o response.json -w '%{http_code}' "${APP}/api/v1/instances" >guest.status
 [ "$(cat guest.status)" = 401 ] || die "没有身份应 401，实际 $(cat guest.status)"
-ok '网关身份与管理员权限'
+# 只带身份头、不带会话：退出登录之后不该被自动带进来
+"${CURL[@]}" "${ADMIN[@]}" -o response.json -w '%{http_code}' "${APP}/api/v1/instances" >guest.status
+[ "$(cat guest.status)" = 401 ] || die "只有身份头没有会话应 401，实际 $(cat guest.status)"
+# 退出登录后旧会话立即失效，再重新登录继续后面的用例
+"${CURL[@]}" -b "${JAR}" -X POST "${APP}/api/v1/auth/logout" -o response.json -w '%{http_code}' >guest.status
+[ "$(cat guest.status)" = 200 ] || die "退出登录应 200，实际 $(cat guest.status)"
+"${CURL[@]}" -b "${JAR}" -o response.json -w '%{http_code}' "${APP}/api/v1/instances" >guest.status
+[ "$(cat guest.status)" = 401 ] || die "退出后旧会话应失效，实际 $(cat guest.status)"
+login_status="$("${CURL[@]}" "${ADMIN[@]}" -X POST "${APP}/api/v1/auth/login" -c "${JAR}" -o response.json -w '%{http_code}')"
+[ "${login_status}" = 200 ] || die "重新登录应 200，实际 ${login_status}：$(cat response.json)"
+ok '网关身份、管理员登录与退出'
 
 # 概览 / 设置 / 任务 / 镜像
 req 200 GET /overview
@@ -190,13 +217,15 @@ req 404 GET /deploy-tasks/nope
 ok '概览、镜像、设置、任务与未知任务 404'
 
 # 参数校验：全部在异步之前挡住
-req 400 POST /instances '{"name":"x","engine":"postgres"}'
-contains '只支持 MySQL'
+req 400 POST /instances '{"name":"x","engine":"sqlite"}'
+contains '不支持的引擎'
 req 400 POST /instances '{"name":"x","engineVersion":"9.9"}'
 contains '不支持这个版本'
 req 400 POST /instances '{"name":"x","users":[{"name":"u","password":"123","level":"read"}]}'
 req 400 POST /instances '{"name":"x","users":[{"name":"u","password":"password123","level":"root"}]}'
 req 400 POST /instances '{"name":"a/b"}'
+req 400 POST /instances/connect '{"name":"外部库","engine":"mysql","host":"mysql://bad","port":3306,"username":"root","password":"12345678"}'
+contains '不要带协议'
 if [ "${SMOKE_DOCKER:-0}" != "1" ]; then
   # 没有 Docker 时，参数合法的请求也要在动手之前说清楚原因，而不是挂一个注定的任务
   req 400 POST /instances '{"name":"校验库"}'
@@ -208,7 +237,7 @@ fi
 
 
 # ---------- 依赖 Docker 的部分 ----------
-"${CURL[@]}" "${ADMIN[@]}" "${APP}/api/v1/health" -o health.json 2>/dev/null || true
+"${CURL[@]}" -b "${JAR}" "${APP}/api/v1/health" -o health.json 2>/dev/null || true
 DOCKER_OK="$(sed -n 's/.*"docker":\(true\|false\).*/\1/p' health.json 2>/dev/null | head -n 1)"
 if [ "${SMOKE_DOCKER:-0}" = "1" ] && [ "${DOCKER_OK:-false}" != "true" ]; then
   echo "  [info] 服务端读不到 Docker：$(cat health.json 2>/dev/null)"

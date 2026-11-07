@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ArrowRight, CircleCheck, Download, Plus, Refresh, WarningFilled } from '@element-plus/icons-vue'
-import { api, type Overview } from '../api'
+import { api, engineLabel, type Overview } from '../api'
 import { errText, formatBytes, jobTypeText, relativeTime } from '../format'
 
-const emit = defineEmits<{ navigate: [view: 'instances' | 'images' | 'jobs' | 'audit' | 'diag'] }>()
+const emit = defineEmits<{
+  navigate: [view: 'instances' | 'images' | 'jobs' | 'audit' | 'diag']
+  open: [id: string]
+}>()
 
 const data = ref<Overview | null>(null)
 const loading = ref(false)
@@ -24,17 +27,14 @@ async function load() {
 
 onMounted(load)
 
-const ENGINE_TONE: Record<string, string> = {
-  postgres: 'tone-blue',
-  mysql: 'tone-green',
-  sqlite: 'tone-slate',
+// 镜像系列 → 角标：一屏里要能一眼分出 MySQL / MariaDB / PostgreSQL，
+// 光看版本号会撞（都叫 16），必须带上系列
+const FAMILY_BADGE: Record<string, { tone: string; text: string }> = {
+  mysql: { tone: 'tone-blue', text: 'MY' },
+  mariadb: { tone: 'tone-slate', text: 'MA' },
+  postgres: { tone: 'tone-green', text: 'PG' },
+  mongodb: { tone: 'tone-green', text: 'MO' },
 }
-const ENGINE_BADGE: Record<string, string> = {
-  postgres: 'PG',
-  mysql: 'My',
-  sqlite: 'SQ',
-}
-// 只有 MySQL 协议系：版本就是镜像 tag
 
 
 const instances = computed(() => data.value?.instances.items ?? [])
@@ -53,7 +53,7 @@ const headline = computed(() => {
   const d = data.value
   if (!d) return '正在读取真实状态…'
   if (d.instances.total === 0) return '还没有数据库实例，先建一个吧。'
-  const parts = [`${d.instances.total} 个实例`]
+  const parts = [`${d.instances.total} 个数据库服务`]
   if (d.instances.running) parts.push(`${d.instances.running} 个在运行`)
   if (d.instances.error) parts.push(`${d.instances.error} 个异常`)
   if (d.jobs.active) parts.push(`${d.jobs.active} 个任务进行中`)
@@ -81,8 +81,26 @@ const alerts = computed(() => {
   return out
 })
 
-function statusText(status: string) {
-  return { running: '运行中', stopped: '已停止', error: '异常', creating: '创建中' }[status] ?? status
+function statusText(status: string, mode?: string) {
+  if (mode === 'external') {
+    if (status === 'running') return '已连接'
+    if (status === 'error') return '连接失败'
+  }
+  return { running: '运行中', stopped: '已停止', error: '异常', creating: '创建中', failed: '部署失败' }[status] ?? status
+}
+
+const BACKUP_STATUS_TEXT: Record<string, string> = {
+  running: '进行中',
+  succeeded: '成功',
+  failed: '失败',
+}
+
+const JOB_STATUS_TEXT: Record<string, string> = {
+  queued: '排队中',
+  running: '进行中',
+  succeeded: '成功',
+  failed: '失败',
+  canceled: '已取消',
 }
 </script>
 
@@ -92,7 +110,7 @@ function statusText(status: string) {
 
     <el-card shadow="never" class="hero">
       <div class="hero-main">
-        <h2>数据库总览</h2>
+        <h2>工作台</h2>
         <p class="hero-sub">{{ headline }}</p>
         <div class="hero-facts">
           <span>{{ readyImages }} / {{ totalImages }} 个镜像已在本机</span>
@@ -112,13 +130,13 @@ function statusText(status: string) {
       </div>
       <div class="hero-actions">
         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
-        <el-button type="primary" :icon="Plus" @click="emit('navigate', 'instances')">创建数据库</el-button>
+        <el-button type="primary" :icon="Plus" @click="emit('navigate', 'instances')">添加数据库服务</el-button>
       </div>
     </el-card>
 
     <div class="metrics">
       <button type="button" class="metric" @click="emit('navigate', 'instances')">
-        <span class="metric-label">实例</span>
+        <span class="metric-label">服务</span>
         <strong>{{ data?.instances.total ?? 0 }}</strong>
         <span class="metric-sub">
           {{ data?.instances.running ?? 0 }} 运行中<template v-if="data?.instances.stopped">
@@ -144,7 +162,7 @@ function statusText(status: string) {
       </button>
     </div>
 
-    <el-card shadow="never" class="block">
+    <el-card shadow="never" class="block images-block">
       <template #header>
         <div class="block-head">
           <span>镜像</span>
@@ -163,8 +181,8 @@ function statusText(status: string) {
           @click="emit('navigate', 'images')"
         >
           <div class="engine-top">
-            <span class="badge" :class="img.family === 'mysql' ? 'tone-blue' : 'tone-slate'">
-              {{ img.family === 'mysql' ? 'MY' : 'MA' }}
+            <span class="badge" :class="FAMILY_BADGE[img.family]?.tone ?? 'tone-slate'">
+              {{ FAMILY_BADGE[img.family]?.text ?? img.family }}
             </span>
             <span class="engine-id">
               <strong>{{ img.label }}</strong>
@@ -185,28 +203,28 @@ function statusText(status: string) {
       </div>
     </el-card>
 
-    <el-card v-if="instances.length" shadow="never" class="block">
+    <el-card v-if="instances.length" shadow="never" class="block services-block">
       <template #header>
         <div class="block-head">
-          <span>最近的实例</span>
+          <span>最近的数据库服务</span>
           <span class="block-note">按创建时间倒序，最多 8 条</span>
         </div>
       </template>
       <div class="backups">
-        <button v-for="i in instances" :key="i.id" type="button" class="backup-row" @click="emit('navigate', 'instances')">
+        <button v-for="i in instances" :key="i.id" type="button" class="backup-row" @click="emit('open', i.id)">
           <span class="backup-dot" :class="i.status === 'running' ? 'ok' : 'bad'" />
           <span class="backup-main">
             <strong>{{ i.name }}</strong>
             <span class="backup-file">
-              MySQL {{ i.engineVersion }}
-              · Docker
+              {{ engineLabel(i.engine) }} {{ i.engineVersion }}
+              · {{ i.mode === 'external' ? '外部连接' : 'Docker' }}
               <template v-if="i.port">· :{{ i.port }}</template>
             </span>
           </span>
           <span class="backup-side">
-            <span>{{ statusText(i.status) }}</span>
+            <span>{{ statusText(i.status, i.mode) }}</span>
             <span class="muted">
-              {{ !i.sizeBytes ? '卷内' : formatBytes(i.sizeBytes) }}
+              {{ i.mode === 'external' ? '外部库' : !i.sizeBytes ? '卷内' : formatBytes(i.sizeBytes) }}
             </span>
           </span>
         </button>
@@ -236,7 +254,7 @@ function statusText(status: string) {
             </span>
             <span class="backup-side">
               <span>{{ relativeTime(b.startedAt) }}</span>
-              <span class="muted">{{ b.sizeBytes ? formatBytes(b.sizeBytes) : b.status }}</span>
+              <span class="muted">{{ b.sizeBytes ? formatBytes(b.sizeBytes) : (BACKUP_STATUS_TEXT[b.status] ?? b.status) }}</span>
             </span>
           </button>
         </div>
@@ -261,7 +279,7 @@ function statusText(status: string) {
             </span>
             <span class="backup-side">
               <span>{{ relativeTime(j.createdAt) }}</span>
-              <span class="muted">{{ j.status }}</span>
+              <span class="muted">{{ JOB_STATUS_TEXT[j.status] ?? j.status }}</span>
             </span>
           </button>
         </div>
@@ -271,7 +289,7 @@ function statusText(status: string) {
       </el-card>
     </div>
 
-    <el-card shadow="never" class="block">
+    <el-card shadow="never" class="block alerts-block">
       <template #header>
         <div class="block-head">
           <span>需要注意</span>
@@ -313,9 +331,16 @@ function statusText(status: string) {
   margin: 0 auto;
 }
 
+.hero { order: 1; }
+.alerts-block { order: 2; }
+.metrics { order: 3; }
+.services-block { order: 4; }
+.page > .cols { order: 5; }
+.images-block { order: 6; }
+
 /* ---------- 顶部 ---------- */
 .hero {
-  border-style: dashed;
+  border-style: solid;
 }
 
 .hero :deep(.el-card__body) {
@@ -369,25 +394,33 @@ function statusText(status: string) {
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elevated);
 }
 
 .metric {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
+  padding: 12px 16px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
   color: inherit;
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.15s, transform 0.15s;
+  transition: background 0.15s;
 }
 
 .metric:hover {
-  border-color: var(--el-color-primary-light-5);
+  background: var(--bg);
+}
+
+.metric:last-child {
+  border-right: 0;
 }
 
 .metric-label {
@@ -775,6 +808,14 @@ function statusText(status: string) {
 
   .metric {
     padding: 12px 13px;
+  }
+
+  .metric:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .metric:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--line);
   }
 
   .metric strong {

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"niudbm/server/internal/mysqlctl"
 	"niudbm/server/internal/store"
 	"niudbm/server/internal/ulid"
 )
@@ -29,6 +28,36 @@ type restoreReq struct {
 	ConfirmName string `json:"confirmName"`
 }
 
+func (s *Server) handleListBackupCenter(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.require(w, r, false)
+	if !ok {
+		return
+	}
+	var (
+		items []store.BackupWithInstance
+		err   error
+	)
+	if id.IsAdmin {
+		items, err = s.st.ListRecentBackups(r.Context(), 500)
+	} else {
+		roles, rerr := s.st.InstanceIDsForMember(r.Context(), id.UserID)
+		if rerr != nil {
+			s.fail(w, r, errInternal("读取服务权限失败"))
+			return
+		}
+		ids := make([]string, 0, len(roles))
+		for instanceID := range roles {
+			ids = append(ids, instanceID)
+		}
+		items, err = s.st.ListRecentBackupsForInstances(r.Context(), ids, 500)
+	}
+	if err != nil {
+		s.fail(w, r, errInternal("读取备份列表失败"))
+		return
+	}
+	writeOK(w, r, map[string]any{"items": items, "total": len(items)})
+}
+
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, false); !ok {
 		return
@@ -37,7 +66,6 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-
 	list, err := s.st.ListBackups(r.Context(), in.ID)
 	if err != nil {
 		s.fail(w, r, errInternal("读取备份列表失败"))
@@ -55,6 +83,10 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部连接暂不支持由本应用创建备份，请使用数据库自身的备份方案"))
+		return
+	}
 
 	var req backupReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -68,7 +100,7 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, errBadRequest("请选择要备份的库"))
 		return
 	}
-	if err := mysqlctl.ValidDBName(dbName); err != nil {
+	if err := validDBName(in, dbName); err != nil {
 		s.fail(w, r, errBadRequest(err.Error()))
 		return
 	}
@@ -100,6 +132,10 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	in, ok := s.load(w, r)
 	if !ok {
+		return
+	}
+	if isExternal(in) {
+		s.fail(w, r, errBadRequest("外部连接暂不支持由本应用恢复备份，请使用数据库自身的恢复方案"))
 		return
 	}
 
@@ -173,7 +209,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 //
 // 恢复要求实例在运行，Restore 内部会保证这一点。
 func (s *Server) restoreInto(r *http.Request, in store.Instance, src string) error {
-	spec, err := s.mysqlSpec(in)
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		return err
 	}
@@ -247,7 +283,10 @@ func (s *Server) makeBackup(ctx context.Context, in store.Instance, kind, note, 
 	// 只做逻辑备份：dump 出来是 .sql，跨版本、跨机器都能直接导入，
 	// 也不需要停容器，日常备份不会打断用户连接。
 	ext := ".sql"
-	spec, err := s.mysqlSpec(in)
+	if in.Engine == engineMongoDB {
+		ext = ".archive.gz"
+	}
+	spec, err := s.dbSpec(in)
 	if err != nil {
 		return store.Backup{}, errBadRequest(err.Error())
 	}
@@ -300,7 +339,7 @@ func (s *Server) makeBackup(ctx context.Context, in store.Instance, kind, note, 
 	if err := spec.Backup(dst, database); err != nil {
 		return finish(err)
 	}
-	if err := mysqlctl.Verify(dst); err != nil {
+	if err := spec.VerifyBackup(dst); err != nil {
 		return finish(fmt.Errorf("备份文件校验失败：%w", err))
 	}
 	return finish(nil)
