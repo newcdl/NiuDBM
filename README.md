@@ -93,6 +93,22 @@ scripts/build.sh --pack
 
 默认同时构建 `amd64` 和 `arm64`，产物位于 `dist/`。
 
+## GitHub 自动发布
+
+推送 `vMAJOR.MINOR.PATCH` 格式的标签会触发 GitHub Actions：
+
+- 校验标签版本与 `niudbm/manifest` 一致。
+- 运行 Go 检查、单元测试、前端类型检查和生产构建。
+- 使用飞牛官方 `fnpack` 生成 `amd64` 与 `arm64` 两个 FPK。
+- 上传工作流产物并创建 GitHub Release。
+
+```bash
+git tag -a v1.0.1 -m "牛库管家 v1.0.1"
+git push origin v1.0.1
+```
+
+发布新版本前，需要同步更新 `niudbm/manifest`、服务默认版本、前端版本和 `CHANGELOG.md`。
+
 ## 飞牛部署
 
 - `niudbm/main` 负责启动 Go 服务。

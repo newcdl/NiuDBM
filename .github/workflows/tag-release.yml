@@ -1,0 +1,119 @@
+name: Tag Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FNPACK_URL: https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+  FNPACK_SHA256: 54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag and application version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          app_version="$(grep '^version=' niudbm/manifest | cut -d= -f2)"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "标签必须使用 vMAJOR.MINOR.PATCH 格式，例如 v1.0.0" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$app_version" ]]; then
+            echo "标签版本 $tag_version 与 niudbm/manifest 中的 $app_version 不一致" >&2
+            exit 1
+          fi
+
+      - name: Run backend checks
+        working-directory: server
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Build frontend
+        working-directory: web
+        run: pnpm build
+
+      - name: Install official fnpack
+        shell: bash
+        run: |
+          fnpack_path="$RUNNER_TEMP/fnpack"
+          curl -fsSL "$FNPACK_URL" -o "$fnpack_path"
+          echo "$FNPACK_SHA256  $fnpack_path" | sha256sum -c -
+          chmod +x "$fnpack_path"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build amd64 and arm64 packages
+        run: scripts/build.sh --skip-web --skip-test --pack
+
+      - name: Verify release files
+        shell: bash
+        run: |
+          version="$(grep '^version=' niudbm/manifest | cut -d= -f2)"
+          test -s "dist/niudbm-$version-amd64.fpk"
+          test -s "dist/niudbm-$version-arm64.fpk"
+          test -s "dist/niudbm-$version-amd64-SHA256SUMS.txt"
+          test -s "dist/niudbm-$version-arm64-SHA256SUMS.txt"
+          (cd dist && sha256sum -c "niudbm-$version-amd64-SHA256SUMS.txt")
+          (cd dist && sha256sum -c "niudbm-$version-arm64-SHA256SUMS.txt")
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: niudbm-${{ github.ref_name }}
+          path: |
+            dist/*.fpk
+            dist/*-SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.fpk \
+            dist/*-SHA256SUMS.txt \
+            --title "牛库管家 $GITHUB_REF_NAME" \
+            --generate-notes
